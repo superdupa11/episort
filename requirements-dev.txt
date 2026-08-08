@@ -1,0 +1,7 @@
+# Development/testing dependencies for identifier.py — not needed to run the
+# tool itself, only to run the test suite in tests/.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   pytest
+
+pytest>=7.4.0

@@ -1,0 +1,23 @@
+# TV Show Episode Identifier — dependencies
+#
+# System requirement: ffmpeg must be installed
+#   macOS:   brew install ffmpeg
+#   Ubuntu:  sudo apt install ffmpeg
+#   Windows: https://ffmpeg.org/download.html
+#
+# Install Python deps:
+#   pip install -r requirements.txt
+#
+# For Whisper transcription (fallback when no embedded subtitles):
+#   pip install openai-whisper
+#   First run will download the chosen model (~74 MB for 'base', ~1.5 GB for 'large')
+
+requests>=2.31.0
+
+# Fuzzy text matching (tolerates typos/OCR noise in community-made subtitles)
+# and its numpy dependency for vectorized similarity scoring.
+rapidfuzz>=3.6.0
+numpy>=1.24.0
+
+# Optional — remove if you won't use Whisper transcription
+openai-whisper>=20231117

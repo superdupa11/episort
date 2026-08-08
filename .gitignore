@@ -1,0 +1,17 @@
+# Secrets — real API keys/credentials live here, never commit
+tv.secrets
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local run output — not source, not fixtures
+match_logs/
+
+# Editor / OS
+.vscode/
+.DS_Store
