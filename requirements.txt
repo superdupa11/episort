@@ -1,4 +1,4 @@
-# TV Show Episode Identifier — dependencies
+# EpiSort — dependencies
 #
 # System requirement: ffmpeg must be installed
 #   macOS:   brew install ffmpeg

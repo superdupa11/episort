@@ -1,8 +1,8 @@
 ---
-description: Publish TV Show Episode Identifier - secret-scan, run tests, commit, push to GitHub. Use when the user asks to publish, ship, or release an update.
+description: Publish EpiSort - secret-scan, run tests, commit, push to GitHub. Use when the user asks to publish, ship, or release an update.
 ---
 
-You are running the publish flow for tv-show-identifier. This is a local
+You are running the publish flow for episort. This is a local
 Python CLI tool (no server, no container, no deploy target) — publishing
 means getting a clean, secret-free commit onto GitHub. There is no build or
 remote-deploy stage.
@@ -17,7 +17,7 @@ otherwise skip straight to "Steps."
 
 | Thing | Value |
 |---|---|
-| GitHub repo | `superdupa11/tv-show-identifier` (public) |
+| GitHub repo | `superdupa11/episort` (public) |
 | Secrets file | `tv.secrets` (real credentials — gitignored, never staged) |
 | Local run output | `match_logs/` (gitignored — not source, not fixtures) |
 | Test suite | `pytest` (see `tests/`, deps in `requirements-dev.txt`) |
@@ -49,7 +49,7 @@ repo and push in one step — **this is the push checkpoint**, confirm with
 the user first since it makes the repo public:
 
 ```bash
-gh repo create superdupa11/tv-show-identifier --public --source=. --remote=origin --push
+gh repo create superdupa11/episort --public --source=. --remote=origin --push
 ```
 
 That single command creates the remote repo, wires up `origin`, and pushes
@@ -123,7 +123,7 @@ git push origin main
 | `python3 -m pytest` fails with a real test failure | Real bug — fix it, don't publish around it |
 | `python3 -m pytest` fails with "No module named pytest" | Dev deps not installed in this environment — ask the user how to install `requirements-dev.txt` here, don't guess `--break-system-packages` |
 | `git push` rejected (non-fast-forward) | `origin/main` has commits this checkout doesn't — `git pull --rebase` and resolve, don't force-push |
-| `gh repo create` fails with "name already exists" | Repo was already created on a prior run — just add the remote (`git remote add origin https://github.com/superdupa11/tv-show-identifier.git`) and push instead |
+| `gh repo create` fails with "name already exists" | Repo was already created on a prior run — just add the remote (`git remote add origin https://github.com/superdupa11/episort.git`) and push instead |
 | Secret-shaped grep hit on a real value | Stop. Do not commit. Rotate the credential if it was ever staged/committed, even locally-only — treat as compromised. |
 
 ## After publishing

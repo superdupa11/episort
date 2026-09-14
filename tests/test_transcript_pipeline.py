@@ -73,14 +73,14 @@ def test_transcript_cache_hit_avoids_recomputation(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_get_transcript(mkv_path, model, duration, skip, no_whisper, initial_prompt=None):
+    def fake_get_transcript(mkv_path, model, duration, skip, no_whisper, whisper_url, local_whisper, initial_prompt=None):
         calls.append(1)
         return "the real transcript", 2640.0
 
     monkeypatch.setattr(I, "get_transcript", fake_get_transcript)
 
-    t1, d1 = I.get_transcript_cached(mkv, "medium", 0, 60, False, cache_dir)
-    t2, d2 = I.get_transcript_cached(mkv, "medium", 0, 60, False, cache_dir)
+    t1, d1 = I.get_transcript_cached(mkv, "medium", 0, 60, False, "http://x.invalid", True, cache_dir)
+    t2, d2 = I.get_transcript_cached(mkv, "medium", 0, 60, False, "http://x.invalid", True, cache_dir)
 
     assert t1 == t2 == "the real transcript"
     assert d1 == d2 == 2640.0
@@ -94,14 +94,14 @@ def test_transcript_cache_miss_when_whisper_model_changes(tmp_path, monkeypatch)
 
     calls = []
 
-    def fake_get_transcript(mkv_path, model, duration, skip, no_whisper, initial_prompt=None):
+    def fake_get_transcript(mkv_path, model, duration, skip, no_whisper, whisper_url, local_whisper, initial_prompt=None):
         calls.append(model)
         return f"transcript from {model}", 100.0
 
     monkeypatch.setattr(I, "get_transcript", fake_get_transcript)
 
-    I.get_transcript_cached(mkv, "base", 0, 60, False, cache_dir)
-    I.get_transcript_cached(mkv, "medium", 0, 60, False, cache_dir)
+    I.get_transcript_cached(mkv, "base", 0, 60, False, "http://x.invalid", True, cache_dir)
+    I.get_transcript_cached(mkv, "medium", 0, 60, False, "http://x.invalid", True, cache_dir)
 
     assert calls == ["base", "medium"]  # different settings -> different cache key -> both ran
 
@@ -112,14 +112,14 @@ def test_transcript_cache_none_dir_always_calls_through(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_get_transcript(mkv_path, model, duration, skip, no_whisper, initial_prompt=None):
+    def fake_get_transcript(mkv_path, model, duration, skip, no_whisper, whisper_url, local_whisper, initial_prompt=None):
         calls.append(1)
         return "x", 1.0
 
     monkeypatch.setattr(I, "get_transcript", fake_get_transcript)
 
-    I.get_transcript_cached(mkv, "base", 0, 60, False, None)
-    I.get_transcript_cached(mkv, "base", 0, 60, False, None)
+    I.get_transcript_cached(mkv, "base", 0, 60, False, "http://x.invalid", True, None)
+    I.get_transcript_cached(mkv, "base", 0, 60, False, "http://x.invalid", True, None)
 
     assert len(calls) == 2  # no cache dir -> caching disabled, always recomputes
 
@@ -134,7 +134,7 @@ def test_transcript_cache_does_not_persist_none_results(tmp_path, monkeypatch):
         lambda *a, **k: (None, 0.0),
     )
 
-    transcript, duration = I.get_transcript_cached(mkv, "base", 0, 60, False, cache_dir)
+    transcript, duration = I.get_transcript_cached(mkv, "base", 0, 60, False, "http://x.invalid", True, cache_dir)
     assert transcript is None
     # A "too short/no usable content" result is cheap to recompute -> not cached.
     assert not cache_dir.exists() or not any(cache_dir.iterdir())

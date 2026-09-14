@@ -68,7 +68,10 @@ def test_alignment_is_conclusive_false_for_single_file():
     assert I._alignment_is_conclusive([0], candidates) is False
 
 
-def test_alignment_is_conclusive_false_when_any_file_unassigned():
+def test_alignment_is_conclusive_false_when_unassigned_row_leaves_a_gap():
+    # Row 1 unassigned, but the assigned rows land on E09 then E11 -- a gap
+    # (E10 skipped), not one unbroken run, so this stays inconclusive even
+    # though the unassigned row itself is now tolerated on its own.
     candidates = _eps(9, 10, 11)
     picks = [0, None, 2]
     assert I._alignment_is_conclusive(picks, candidates) is False
@@ -83,6 +86,25 @@ def test_alignment_is_conclusive_false_when_episode_skipped():
 
 def test_alignment_is_conclusive_false_for_empty_picks():
     assert I._alignment_is_conclusive([], _eps(9)) is False
+
+
+def test_alignment_is_conclusive_true_despite_unassigned_duplicate_titles():
+    # 5 files ripped for 4 episodes (a duplicate/bonus title in the middle
+    # that lost its column to a stronger row) -- the real-world MakeMKV
+    # situation this tolerance exists for. The assigned majority still forms
+    # an unbroken run, so this should now read as confirmed.
+    candidates = _eps(9, 10, 11, 12)
+    picks = [0, None, 1, 2, 3]
+    assert I._alignment_is_conclusive(picks, candidates) is True
+
+
+def test_alignment_is_conclusive_false_when_assigned_rows_are_not_a_majority():
+    # Only 2 of 10 rows assigned, even though those two happen to be
+    # consecutive -- too little of the group actually lined up to count as
+    # independent corroboration.
+    candidates = _eps(9, 10)
+    picks = [None, None, None, None, None, None, None, None, 0, 1]
+    assert I._alignment_is_conclusive(picks, candidates) is False
 
 
 # ---------------------------------------------------------------------------
@@ -333,3 +355,62 @@ def test_refine_early_return_when_max_alternates_zero():
     )
     assert returned_scores == scores
     assert raw == 0.5
+
+
+# ---------------------------------------------------------------------------
+# match_with_local_ai
+# ---------------------------------------------------------------------------
+class _FakeResponse:
+    """Minimal requests.Response stand-in for match_with_local_ai tests."""
+
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+        self.text = str(body)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.exceptions.HTTPError(
+                f"{self.status_code} Client Error: Not Found for url: X", response=self
+            )
+
+    def json(self):
+        return self._body
+
+
+def test_match_with_local_ai_surfaces_error_body_on_http_error(monkeypatch, caplog):
+    # A wrong/unpulled model name (e.g. "qwen2.5:14b" instead of the actually-pulled
+    # "qwen2.5-coder:14b") 404s at the HTTP layer. requests' default exception message
+    # alone ("404 Client Error: Not Found for url: ...") reads exactly like a proxy
+    # routing failure -- the real cause is in the JSON error body, which must make it
+    # into the log instead of being swallowed.
+    monkeypatch.setattr(
+        I.requests, "post",
+        lambda url, json, timeout: _FakeResponse(
+            404, {"error": {"message": "model 'qwen2.5:14b' not found", "type": "not_found_error"}}
+        ),
+    )
+    with caplog.at_level("ERROR"):
+        ep, conf = I.match_with_local_ai(
+            "transcript", [{"season": 5, "number": 1, "name": "Ep"}], "Show",
+            "qwen2.5:14b", "https://ollama.example.net",
+        )
+    assert ep is None and conf == 0.0
+    assert "model 'qwen2.5:14b' not found" in caplog.text
+
+
+def test_match_with_local_ai_falls_back_to_raw_text_on_non_json_error_body(monkeypatch, caplog):
+    # A misconfigured reverse proxy can 404 with an HTML error page rather than a
+    # JSON body -- the fallback must not crash and should still surface something.
+    monkeypatch.setattr(
+        I.requests, "post",
+        lambda url, json, timeout: _FakeResponse(404, "<html>not found</html>"),
+    )
+    with caplog.at_level("ERROR"):
+        ep, conf = I.match_with_local_ai(
+            "transcript", [{"season": 5, "number": 1, "name": "Ep"}], "Show",
+            "some-model", "https://ollama.example.net",
+        )
+    assert ep is None and conf == 0.0
+    assert "local-ai matching failed" in caplog.text

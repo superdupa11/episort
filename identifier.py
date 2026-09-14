@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TV Show Episode Identifier
+EpiSort
 
 Scans a directory of MKV files ripped from BluRay discs, extracts dialogue via
 embedded subtitles or local Whisper transcription, compares against reference
@@ -18,6 +18,7 @@ Usage:
 Secrets file (recommended):
     Create a .secrets file next to identifier.py (KEY=VALUE, one per line).
     Environment variables override values from the file if both are set.
+
 
     OPENSUBTITLES_API_KEY=xxxxx
     OPENSUBTITLES_USERNAME=youruser
@@ -45,12 +46,15 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import wave
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -102,6 +106,44 @@ def _load_secrets(secrets_path: Optional[Path] = None) -> None:
 OPENSUBTITLES_BASE = "https://api.opensubtitles.com/api/v1"
 TVMAZE_BASE = "https://api.tvmaze.com"
 TMDB_BASE = "https://api.themoviedb.org/3"
+
+OLLAMA_BASE_URL = "https://ollama.walztech.net"  # --local-ai-url default; change this one
+                                                   # constant to repoint every run at a
+                                                   # different Ollama/LM Studio host. Point
+                                                   # it at http://localhost:11434 to go back
+                                                   # to a local Ollama instance (which this
+                                                   # script can then auto-start/stop itself —
+                                                   # see _is_local_ollama_url below).
+OLLAMA_DEFAULT_MODEL = "qwen3:30b-a3b"            # --local-ai default model when neither
+                                                   # --local-ai nor --ai-fallback is passed —
+                                                   # keep this in sync with whatever's actually
+                                                   # pulled on OLLAMA_BASE_URL (`ollama list`),
+                                                   # or AI fallback 404s on a missing model.
+
+WHISPER_BASE_URL = "https://speaches.walztech.net"  # --whisper-url default; a speaches
+                                                     # (formerly faster-whisper-server) instance.
+                                                     # Transcription is offloaded there by default —
+                                                     # pass --local-whisper to transcribe in-process
+                                                     # with the local openai-whisper package instead
+                                                     # (no network dependency, but requires the
+                                                     # package installed and is usually much slower
+                                                     # without a local GPU).
+                                                     #
+                                                     # If this sits behind a reverse proxy (e.g.
+                                                     # Nginx Proxy Manager), its proxy_read_timeout /
+                                                     # proxy_send_timeout must be raised well past
+                                                     # their defaults (~60s) — CPU transcription of a
+                                                     # full episode can take many minutes with no
+                                                     # bytes sent back until it's done, and the proxy
+                                                     # will otherwise 504 the request out from under
+                                                     # a backend that's still working.
+
+# speaches identifies models by full HuggingFace repo ID (CTranslate2 weights);
+# openai-whisper identifies them by short name (its own PyTorch checkpoints) —
+# the two are different model formats, so --whisper-model can't share one
+# default across both. --local-whisper switches which of these applies.
+WHISPER_REMOTE_DEFAULT_MODEL = "Systran/faster-whisper-large-v3"
+WHISPER_LOCAL_DEFAULT_MODEL = "large-v3"
 
 MIN_DURATION_SECONDS = 300       # 5 minutes — shorter clips are treated as extras
 MIN_TRANSCRIPT_WORDS = 100       # sparse transcript → probably not a full episode
@@ -193,28 +235,53 @@ def parse_args() -> argparse.Namespace:
                    help="Override TV show name (default: inferred from directory structure)")
     p.add_argument("--season", type=int, metavar="N",
                    help="Override season number (default: inferred from directory structure)")
-    p.add_argument("--disc-window", type=int, default=2, metavar="N",
+    p.add_argument("--disc-window", type=int, default=3, metavar="N",
                    help="When a file's path contains a disc number (a 'Disc N' folder, or a "
                         "D<n> token in the filename), bound its candidate episodes to that "
                         "disc's estimated range — the season's episode count split evenly "
                         "across the discs seen — padded by N episodes on each side to absorb "
-                        "uneven disc splits (default: 2). This only bounds which episodes a "
-                        "file's own alignment can land on, not what gets downloaded (the "
-                        "whole season's reference subtitles are always fetched up front), so "
-                        "a wider window costs a few extra comparisons, not extra network calls "
-                        "— err on the side of wider. Set 0 for an exact split, or a large value "
+                        "uneven disc splits (default: 3). This bounds every candidate episode "
+                        "the file is scored against (text match, confidence ratio, AI fallback, "
+                        "the top-N diagnostic) as well as which episode its own alignment can "
+                        "land on — not what gets downloaded (the whole season's reference "
+                        "subtitles are always fetched up front), so a wider window costs a few "
+                        "extra comparisons, not extra network calls — err on the side of wider "
+                        "if discs are unevenly split. Set 0 for an exact split, or a large value "
                         "to effectively disable disc-based narrowing.")
     p.add_argument("--threshold", type=float, default=0.75, metavar="0.0-1.0",
                    help="Confidence required for renaming (default: 0.75)")
     p.add_argument("--dry-run", action="store_true",
                    help="Preview what would be renamed without touching files")
-    p.add_argument("--whisper-model", default="medium",
-                   choices=["tiny", "base", "small", "medium", "large"],
-                   help="Whisper model size used when no embedded subtitle is found (default: "
-                        "medium — a large accuracy jump over base/small at a moderate speed "
-                        "cost; use --whisper-model large for the lowest transcription error "
-                        "rate if you can tolerate it being slower still, or a smaller model "
-                        "when you need speed more than accuracy for a given run).")
+    p.add_argument("--whisper-model", default=None, metavar="MODEL",
+                   help="Whisper model used when no embedded subtitle is found. Default depends "
+                        f"on --local-whisper: without it, {WHISPER_REMOTE_DEFAULT_MODEL} (a full "
+                        "HuggingFace repo ID — what speaches/faster-whisper-server expects, e.g. "
+                        f"a --whisper-url model); with it, {WHISPER_LOCAL_DEFAULT_MODEL} (one of "
+                        "openai-whisper's short local sizes — tiny, base, small, medium, large, "
+                        "large-v2, large-v3). These are different model formats, so a value "
+                        "meant for one will not work with the other.")
+    p.add_argument("--whisper-url", default=WHISPER_BASE_URL, metavar="URL",
+                   help=f"Base URL of the remote speaches/faster-whisper-server instance used "
+                        f"for transcription (default: {WHISPER_BASE_URL}). Ignored when "
+                        "--local-whisper is set.")
+    p.add_argument("--local-whisper", action="store_true",
+                   help="Transcribe in-process with the local openai-whisper package instead "
+                        "of the remote server at --whisper-url. No network dependency, but "
+                        "requires openai-whisper installed locally and is typically much "
+                        "slower without a local GPU.")
+    p.add_argument("--whisper-probe-timeout", type=int, default=30, metavar="SECONDS",
+                   help="Before processing any files, extract a real ~1-minute clip of dialogue "
+                        "from one file being scanned and send it through the real --whisper-url "
+                        "transcription endpoint, waiting up to this many seconds for a response "
+                        "(default: 30). Must be real speech, not silence — a server's voice-"
+                        "activity detection filters silence (and even a pure test tone) out "
+                        "before it reaches the actual model, so those return instantly even when "
+                        "the real inference path is completely wedged (crashed GPU worker, "
+                        "deadlocked request queue) and every real file would hang for up to an "
+                        "hour, one at a time. On failure, falls back to local Whisper for the "
+                        "whole run if openai-whisper is installed (slower, no server dependency); "
+                        "otherwise stops before wasting hours discovering this file by file. "
+                        "Ignored when --local-whisper or --no-whisper is set. Set 0 to skip.")
     p.add_argument("--whisper-duration", type=int, default=0, metavar="MINUTES",
                    help="Minutes of audio to extract before Whisper transcription (default: 0, "
                         "meaning the full audio track — same as --full-scan). More transcribed "
@@ -252,11 +319,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--local-ai", metavar="MODEL",
                    help="Use a local Ollama/LM Studio model as AI fallback instead of Claude. "
                         "Example: --local-ai llama3.1 or --local-ai mistral. "
-                        "No API key required. Requires Ollama or LM Studio running locally.")
-    p.add_argument("--local-ai-url", default="http://localhost:11434",
+                        "No API key required. Requires Ollama or LM Studio running locally. "
+                        f"Defaults to {OLLAMA_DEFAULT_MODEL} when neither this nor --ai-fallback "
+                        "is given; pass --ai-fallback instead to use Claude, or --local-ai with "
+                        "a different model to override.")
+    p.add_argument("--local-ai-url", default=OLLAMA_BASE_URL,
                    metavar="URL",
-                   help="Base URL for the local AI server (default: http://localhost:11434 for Ollama). "
-                        "Use http://localhost:1234 for LM Studio.")
+                   help=f"Base URL for the local-AI server (default: {OLLAMA_BASE_URL}). "
+                        "Point this at a remote Ollama host (as the default does), a local "
+                        "Ollama instance (http://localhost:11434 — auto-started/stopped by "
+                        "this script), or LM Studio (http://localhost:1234).")
     p.add_argument("--log-dir", metavar="DIR", default=None,
                    help="Write a per-file match log (transcript + episode scores + AI prompt) to "
                         "this directory. Useful for debugging low-confidence matches. "
@@ -432,6 +504,10 @@ def narrow_by_disc(
 # 3. MKV discovery
 # ---------------------------------------------------------------------------
 _ALREADY_NAMED = re.compile(r"[Ss]\d{2}[Ee]\d{2}")
+# Anchored, unlike _ALREADY_NAMED above: matches only the exact clean name
+# build_confident_path produces (e.g. "S05E09.mkv"), not an UNMATCHED_ guess
+# that happens to have "S05E09" embedded in it elsewhere in the stem.
+_CONFIDENTLY_NAMED = re.compile(r"^S(\d{2})E(\d{2})$")
 
 
 _VIDEO_EXTENSIONS = ("*.mkv", "*.mp4", "*.m4v")
@@ -449,6 +525,43 @@ def find_video_files(scan_path: Path, force: bool = False) -> list[Path]:
         else:
             to_process.append(f)
     return to_process
+
+
+def find_confidently_matched_episodes(
+    scan_path: Path, exclude: set[Path]
+) -> dict[int, set[int]]:
+    """
+    Scan for video files already confidently renamed elsewhere under scan_path
+    (the plain "SxxExx.ext" convention build_confident_path produces — not an
+    UNMATCHED_ guess, which isn't a real claim), grouped by season.
+
+    Used to keep those episode numbers out of the candidate pool for every OTHER
+    file being processed this run — both so they're never offered as a match to
+    an unrelated file, and, more subtly, so a season split across multiple rip
+    "parts" (e.g. an early half already identified and renamed away in a prior
+    run, a later half — or in this case an earlier-released Part 1 — still
+    pending) doesn't corrupt narrow_by_disc's per-disc episode estimate: that
+    math divides the season's total episode count across the discs currently
+    visible, and if episodes already claimed elsewhere are still in that count,
+    the estimate balloons for a partial scan and every disc's window drifts
+    further off — a real-world case: a season with 14 episodes across the whole
+    series but only 4 "Disc N" files left to identify (the other 6 already
+    renamed) was computing ~4 episodes/disc instead of the true ~2, pushing
+    later discs' windows past their real episodes entirely.
+
+    `exclude` is this run's own to-process set (relevant under --force, where a
+    file being reprocessed may already carry its own confident name) — those
+    don't count as claimed by someone else.
+    """
+    result: dict[int, set[int]] = {}
+    for ext in _VIDEO_EXTENSIONS:
+        for f in scan_path.rglob(ext):
+            if f in exclude:
+                continue
+            m = _CONFIDENTLY_NAMED.match(f.stem)
+            if m:
+                result.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +926,41 @@ def _filter_whisper_segments(result: dict) -> str:
     return " ".join(s.get("text", "").strip() for s in kept).strip()
 
 
+def _extract_audio_clip(
+    mkv_path: Path,
+    skip_seconds: int,
+    duration_minutes: int,
+    audio_stream: Optional[int],
+) -> Path:
+    """
+    Extract a mono 16 kHz WAV clip via ffmpeg for Whisper transcription — shared
+    by both the local and remote transcription paths so the two can never drift
+    apart in what audio they actually hand to Whisper.
+    Returns a temp file the caller must unlink, or mkv_path itself if extraction
+    failed (both callers fall back to handing Whisper the raw file in that case).
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        clip_path = Path(tmp.name)
+    # -ss before -i is a fast input seek; -t limits duration. Omit -t entirely
+    # when duration_minutes is 0 (full-scan mode). Specifying the audio stream
+    # index avoids accidentally using a commentary track.
+    cmd = ["ffmpeg", "-y", "-v", "quiet"]
+    if skip_seconds:
+        cmd += ["-ss", str(skip_seconds)]
+    cmd += ["-i", str(mkv_path)]
+    if audio_stream is not None:
+        cmd += ["-map", f"0:{audio_stream}"]
+    if duration_minutes:
+        cmd += ["-t", str(duration_minutes * 60)]
+    cmd += ["-vn", "-ar", "16000", "-ac", "1", str(clip_path)]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0 or not clip_path.exists():
+        log.warning("  ffmpeg audio extraction failed; falling back to full file")
+        clip_path.unlink(missing_ok=True)
+        return mkv_path
+    return clip_path
+
+
 def transcribe_with_whisper(
     mkv_path: Path,
     model_size: str,
@@ -827,28 +975,11 @@ def transcribe_with_whisper(
     import warnings
     skip_label = f"skip {skip_seconds}s, " if skip_seconds else ""
     dur_label = "full audio" if not duration_minutes else f"next {duration_minutes} min of audio"
-    log.info(f"  Transcribing with Whisper ({model_size}, {skip_label}{dur_label})...")
+    log.info(f"  Transcribing with local Whisper ({model_size}, {skip_label}{dur_label})...")
     try:
         model = _whisper.load_model(model_size)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            clip_path = Path(tmp.name)
+        clip_path = _extract_audio_clip(mkv_path, skip_seconds, duration_minutes, audio_stream)
         try:
-            # Build ffmpeg command. -ss before -i is a fast input seek; -t limits duration.
-            # Omit -t entirely when duration_minutes is 0 (full-scan mode).
-            # Specifying the audio stream index avoids accidentally using a commentary track.
-            cmd = ["ffmpeg", "-y", "-v", "quiet"]
-            if skip_seconds:
-                cmd += ["-ss", str(skip_seconds)]
-            cmd += ["-i", str(mkv_path)]
-            if audio_stream is not None:
-                cmd += ["-map", f"0:{audio_stream}"]
-            if duration_minutes:
-                cmd += ["-t", str(duration_minutes * 60)]
-            cmd += ["-vn", "-ar", "16000", "-ac", "1", str(clip_path)]
-            r = subprocess.run(cmd, capture_output=True)
-            if r.returncode != 0 or not clip_path.exists():
-                log.warning("  ffmpeg audio extraction failed; falling back to full file")
-                clip_path = mkv_path
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
                 result = model.transcribe(
@@ -863,6 +994,186 @@ def transcribe_with_whisper(
         return None
 
 
+def transcribe_with_remote_whisper(
+    mkv_path: Path,
+    model_size: str,
+    duration_minutes: int,
+    base_url: str,
+    skip_seconds: int = 0,
+    audio_stream: Optional[int] = None,
+    initial_prompt: Optional[str] = None,
+) -> Optional[str]:
+    """Ask a remote faster-whisper-server instance to transcribe the audio.
+
+    Uses its OpenAI-compatible /v1/audio/transcriptions endpoint with
+    response_format=verbose_json, which returns the same segment shape (text,
+    no_speech_prob, avg_logprob) that _filter_whisper_segments already expects
+    from the local openai-whisper package — so both paths share that filter.
+    """
+    skip_label = f"skip {skip_seconds}s, " if skip_seconds else ""
+    dur_label = "full audio" if not duration_minutes else f"next {duration_minutes} min of audio"
+    log.info(f"  Transcribing via remote Whisper ({model_size} @ {base_url}, {skip_label}{dur_label})...")
+
+    clip_path = _extract_audio_clip(mkv_path, skip_seconds, duration_minutes, audio_stream)
+    url = base_url.rstrip("/") + "/v1/audio/transcriptions"
+    data = {"model": model_size, "language": "en", "response_format": "verbose_json"}
+    if initial_prompt:
+        data["prompt"] = initial_prompt
+    try:
+        with open(clip_path, "rb") as f:
+            resp = requests.post(
+                url,
+                files={"file": (clip_path.name, f, "audio/wav")},
+                data=data,
+                timeout=3600,  # CPU-only large-v3 transcription of a full episode can take a
+                               # long while with no bytes sent back until it's done — must clear
+                               # both this and the reverse proxy's own read timeout (see
+                               # WHISPER_BASE_URL's comment / --whisper-url help for the NPM note)
+            )
+        resp.raise_for_status()
+        return _filter_whisper_segments(resp.json())
+    except requests.exceptions.ConnectionError:
+        log.error(
+            f"  remote whisper: could not connect to {base_url}. "
+            "Is the faster-whisper-server instance reachable?"
+        )
+        return None
+    except Exception as exc:
+        log.error(f"  remote whisper transcription failed: {exc}")
+        return None
+    finally:
+        if clip_path != mkv_path:
+            clip_path.unlink(missing_ok=True)
+
+
+def _make_tone_wav(seconds: float = 2.0, sample_rate: int = 16000, freq: float = 440.0) -> Path:
+    """
+    Generate a throwaway mono 16 kHz WAV of a pure tone — real acoustic energy,
+    unlike silence, so a server's voice-activity detection won't just skip it.
+    Still not genuine speech though (see probe_remote_whisper's docstring for why
+    that distinction turned out to matter) — only used when no real sample file
+    is available to pull an actual clip from.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        path = Path(tmp.name)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)  # 16-bit PCM
+        w.setframerate(sample_rate)
+        frames = bytearray()
+        for i in range(int(sample_rate * seconds)):
+            val = int(8000 * math.sin(2 * math.pi * freq * i / sample_rate))
+            frames += struct.pack("<h", val)
+        w.writeframes(bytes(frames))
+    return path
+
+
+def find_any_video_file(scan_path: Path) -> Optional[Path]:
+    """
+    First video file found under scan_path, in no particular order — used only
+    to source a short real clip for probe_remote_whisper. Already-identified or
+    not, it's never processed as a candidate, so which one doesn't matter.
+    """
+    for ext in _VIDEO_EXTENSIONS:
+        f = next(scan_path.rglob(ext), None)
+        if f:
+            return f
+    return None
+
+
+def probe_remote_whisper(
+    base_url: str, model_size: str, timeout: int, sample_source: Optional[Path] = None
+) -> bool:
+    """
+    Send a short clip through the real transcription endpoint with a bounded
+    timeout, to catch a wedged backend before a whole run gets committed to it.
+
+    The clip MUST contain real speech, not silence or a pure tone — both of
+    those get filtered out by the server's voice-activity detection before ever
+    reaching the actual inference path, and return in under a second even when
+    that path is completely wedged. (Confirmed directly: a synthetic silent
+    clip, and separately a pure 440Hz tone up to 60s long, both came back
+    instantly against a backend that then hung for a full hour transcribing 58
+    minutes of genuine dialogue — and a real 1-minute clip of that same
+    dialogue reproduced the hang in isolation. VAD-filtered audio never
+    reaches whatever was actually stuck.) So when `sample_source` is given, a
+    real ~1-minute clip is extracted from it via the same _extract_audio_clip
+    path production transcription uses — same code, same kind of content, just
+    short. Falls back to a synthetic tone when no sample_source is available or
+    extraction fails, which only proves the API layer and VAD are alive, not
+    that the model itself still works — better than nothing, but a weaker check.
+    """
+    real_clip = False
+    clip_path: Optional[Path] = None
+    if sample_source is not None:
+        extracted = _extract_audio_clip(sample_source, skip_seconds=60, duration_minutes=1, audio_stream=None)
+        # _extract_audio_clip signals a failed extraction by returning sample_source
+        # itself, not a temp file — never unlink in that case, that's the real source
+        # video, not a throwaway clip.
+        if extracted != sample_source:
+            clip_path, real_clip = extracted, True
+    if clip_path is None:
+        clip_path = _make_tone_wav()
+        log.debug(
+            "Whisper probe: no usable sample file to extract real speech from — probing with a "
+            "synthetic tone instead (weaker check: only proves the API and VAD are alive, not "
+            "that the model itself works)"
+        )
+
+    url = base_url.rstrip("/") + "/v1/audio/transcriptions"
+    try:
+        with open(clip_path, "rb") as f:
+            resp = requests.post(
+                url,
+                files={"file": (clip_path.name, f, "audio/wav")},
+                data={"model": model_size, "language": "en", "response_format": "verbose_json"},
+                timeout=timeout,
+            )
+        resp.raise_for_status()
+        resp.json()  # a real backend returns parseable JSON, not just a 200 with junk
+        return True
+    except requests.exceptions.ConnectionError:
+        log.error(f"Whisper probe: could not connect to {base_url}. Is the server reachable?")
+        return False
+    except requests.exceptions.Timeout:
+        kind = "a real ~1-minute clip of dialogue" if real_clip else "a synthetic test tone"
+        log.error(
+            f"Whisper probe: {base_url} did not respond within {timeout}s transcribing {kind}. "
+            "Its lightweight endpoints (health, model list) — and even non-speech audio, which "
+            "its voice-activity detection filters out before reaching the model — can look "
+            "completely fine while this hangs, so this usually means the actual speech-inference "
+            "path is wedged (crashed GPU context, deadlocked request queue)."
+        )
+        return False
+    except Exception as exc:
+        log.error(f"Whisper probe: {base_url} returned an error: {exc}")
+        return False
+    finally:
+        clip_path.unlink(missing_ok=True)
+
+
+def transcribe_audio(
+    mkv_path: Path,
+    whisper_model: str,
+    duration_minutes: int,
+    whisper_url: str,
+    local_whisper: bool,
+    skip_seconds: int = 0,
+    audio_stream: Optional[int] = None,
+    initial_prompt: Optional[str] = None,
+) -> Optional[str]:
+    """Dispatch to local or remote Whisper transcription per --local-whisper."""
+    if local_whisper:
+        return transcribe_with_whisper(
+            mkv_path, whisper_model, duration_minutes,
+            skip_seconds=skip_seconds, audio_stream=audio_stream, initial_prompt=initial_prompt,
+        )
+    return transcribe_with_remote_whisper(
+        mkv_path, whisper_model, duration_minutes, whisper_url,
+        skip_seconds=skip_seconds, audio_stream=audio_stream, initial_prompt=initial_prompt,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 7. Transcript pipeline
 # ---------------------------------------------------------------------------
@@ -872,6 +1183,8 @@ def get_transcript(
     whisper_duration: int,
     whisper_skip: int,
     no_whisper: bool,
+    whisper_url: str,
+    local_whisper: bool,
     initial_prompt: Optional[str] = None,
 ) -> tuple[Optional[str], float]:
     """
@@ -936,8 +1249,8 @@ def get_transcript(
         return None, 0.0
 
     audio_idx = find_best_audio_stream(media_info)
-    return transcribe_with_whisper(
-        mkv_path, whisper_model, whisper_duration,
+    return transcribe_audio(
+        mkv_path, whisper_model, whisper_duration, whisper_url, local_whisper,
         skip_seconds=whisper_skip, audio_stream=audio_idx, initial_prompt=initial_prompt,
     ), duration
 
@@ -973,7 +1286,7 @@ def build_whisper_initial_prompt(episodes: list[dict], limit: int = 40) -> Optio
 
 def _transcript_cache_key(
     mkv_path: Path, whisper_model: str, whisper_duration: int, whisper_skip: int,
-    initial_prompt: Optional[str],
+    whisper_url: str, local_whisper: bool, initial_prompt: Optional[str],
 ) -> str:
     """
     Identity for a cached transcript: the file's path/size/mtime plus every
@@ -982,12 +1295,26 @@ def _transcript_cache_key(
     season's initial_prompt) naturally misses the cache instead of serving a
     transcript generated under different conditions — a cache invalidation
     mistake here would silently corrupt matching, which is worse than the cost
-    of an occasional unnecessary re-transcription.
+    of an occasional unnecessary re-transcription. The engine/URL is included
+    for the same reason: --local-whisper and a remote faster-whisper-server can
+    produce genuinely different text for the same model name.
+
+    The path component is normalized through _strip_unmatched_prefix rather
+    than used as-is: build_unmatched_path rewrites a file's "UNMATCHED_SxxExx_
+    YYpct_" prefix on essentially every rerun (the guess or confidence pct
+    changes), so hashing the live filename would miss this exact file's own
+    cache entry the moment it gets renamed at the end of the run that created
+    it — silently forcing a full re-transcription on the very next attempt,
+    which defeats the cache for the UNMATCHED-review-and-rerun workflow it
+    exists to support.
     """
     st = mkv_path.stat()
+    stable_name = _strip_unmatched_prefix(mkv_path.stem) + mkv_path.suffix
+    stable_path = mkv_path.parent.resolve() / stable_name
+    engine = "local" if local_whisper else f"remote:{whisper_url}"
     raw = (
-        f"{mkv_path.resolve()}|{st.st_size}|{st.st_mtime}|"
-        f"{whisper_model}|{whisper_duration}|{whisper_skip}|{initial_prompt or ''}"
+        f"{stable_path}|{st.st_size}|{st.st_mtime}|"
+        f"{whisper_model}|{whisper_duration}|{whisper_skip}|{engine}|{initial_prompt or ''}"
     )
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -998,6 +1325,8 @@ def get_transcript_cached(
     whisper_duration: int,
     whisper_skip: int,
     no_whisper: bool,
+    whisper_url: str,
+    local_whisper: bool,
     transcript_cache_dir: Optional[Path],
     initial_prompt: Optional[str] = None,
 ) -> tuple[Optional[str], float]:
@@ -1011,9 +1340,15 @@ def get_transcript_cached(
     need to persist it.
     """
     if transcript_cache_dir is None:
-        return get_transcript(mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper, initial_prompt)
+        return get_transcript(
+            mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper,
+            whisper_url, local_whisper, initial_prompt,
+        )
 
-    key = _transcript_cache_key(mkv_path, whisper_model, whisper_duration, whisper_skip, initial_prompt)
+    key = _transcript_cache_key(
+        mkv_path, whisper_model, whisper_duration, whisper_skip,
+        whisper_url, local_whisper, initial_prompt,
+    )
     cache_path = transcript_cache_dir / f"{key}.json"
     if cache_path.exists():
         try:
@@ -1025,7 +1360,8 @@ def get_transcript_cached(
             pass  # corrupt/partial cache entry — fall through and regenerate it
 
     transcript, duration = get_transcript(
-        mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper, initial_prompt
+        mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper,
+        whisper_url, local_whisper, initial_prompt,
     )
     if transcript is not None:
         try:
@@ -1773,20 +2109,29 @@ def align_monotonic(matrix: list[list[float]], floor: float = QUALITY_FLOOR) -> 
 
 def _alignment_is_conclusive(picks: list[Optional[int]], candidate_episodes: list[dict]) -> bool:
     """
-    True when align_monotonic placed every file in a multi-file group onto one
-    unbroken run of consecutive episode numbers, with none left unassigned.
-    This is independent structural corroboration on top of any single file's
-    own text-match ratio (see GROUP_CONFIRMED_FLOOR): several files' physical
-    rip order lining up end-to-end with the season's episode order is strong
-    evidence a mismatched file is unlikely to produce by chance. A single-file
-    "group" carries none of that corroboration (there's nothing to line up
-    against), and neither does a group with an unassigned row or a skipped
-    episode between two assigned ones.
+    True when align_monotonic placed a clear majority of a multi-file group onto
+    one unbroken run of consecutive episode numbers. This is independent
+    structural corroboration on top of any single file's own text-match ratio
+    (see GROUP_CONFIRMED_FLOOR): several files' physical rip order lining up
+    end-to-end with the season's episode order is strong evidence a mismatched
+    file is unlikely to produce by chance.
+
+    A handful of unassigned rows are tolerated — real disc rips routinely
+    include extra titles beyond the actual episode count (an alternate cut, a
+    second attempt, a bonus feature), which makes "every row assigned" an
+    impossible bar whenever a group has more files than candidate episodes
+    (e.g. 17 titles ripped for a 14-episode season). What still has to hold:
+    the assigned rows must be a clear majority of the group — so a couple of
+    coincidentally-consecutive picks buried in an otherwise-unassigned group
+    can't pass — and must land on a genuinely unbroken run of episode numbers;
+    a gap between two assigned rows (an episode skipped, not just a row left
+    out) still fails this. A single-file "group" carries none of that
+    corroboration (there's nothing to line up against).
     """
-    if len(picks) < 2 or any(p is None for p in picks):
+    assigned = [candidate_episodes[p]["number"] for p in picks if p is not None]
+    if len(assigned) < 2 or len(assigned) <= len(picks) / 2:
         return False
-    numbers = [candidate_episodes[p]["number"] for p in picks]
-    return all(b == a + 1 for a, b in zip(numbers, numbers[1:]))
+    return all(b == a + 1 for a, b in zip(assigned, assigned[1:]))
 
 
 def match_by_text(
@@ -2000,10 +2345,26 @@ def match_with_local_ai(
         raw = resp.json()["choices"][0]["message"]["content"].strip()
         return _parse_ai_episode_response(raw, episodes, f"local-ai({model})")
     except requests.exceptions.ConnectionError:
-        log.error(
-            f"  local-ai: could not connect to {base_url}. "
+        hint = (
             "Is Ollama/LM Studio running? (ollama serve)"
+            if _is_local_ollama_url(base_url)
+            else "Is the remote server reachable and running Ollama/LM Studio?"
         )
+        log.error(f"  local-ai: could not connect to {base_url}. {hint}")
+        return None, 0.0
+    except requests.exceptions.HTTPError as exc:
+        # requests' default message is just "404 Client Error: Not Found for url:
+        # ...", which reads like a routing/proxy problem — the actual cause (wrong
+        # model name, context length exceeded, etc.) is in the response body. Ollama
+        # and LM Studio both return {"error": "..."} or {"error": {"message": "..."}}
+        # on failure, so surface that instead of leaving it to manual curl digging.
+        detail = None
+        try:
+            err = exc.response.json().get("error")
+            detail = err.get("message") if isinstance(err, dict) else err
+        except Exception:
+            detail = (exc.response.text or "").strip()[:200] or None
+        log.error(f"  local-ai matching failed: {exc}" + (f" — {detail}" if detail else ""))
         return None, 0.0
     except Exception as exc:
         log.error(f"  local-ai matching failed: {exc}")
@@ -2013,6 +2374,16 @@ def match_with_local_ai(
 # ---------------------------------------------------------------------------
 # 11. Ollama lifecycle helpers
 # ---------------------------------------------------------------------------
+def _is_local_ollama_url(base_url: str) -> bool:
+    """True when base_url points at this machine, not a remote server.
+
+    Lifecycle management (auto-start/stop of `ollama serve`) only makes sense
+    for a local instance — a remote host like OLLAMA_BASE_URL is someone
+    else's process to manage, so callers use this to skip that entirely.
+    """
+    return base_url.startswith("http://localhost") or base_url.startswith("http://127.0.0.1")
+
+
 def _ollama_is_running(base_url: str) -> bool:
     try:
         r = requests.get(base_url.rstrip("/") + "/", timeout=2)
@@ -2028,8 +2399,8 @@ def ollama_start(base_url: str) -> Optional[subprocess.Popen]:
     if it was already running (caller must leave it alone).
     Only attempted when the base URL looks like a local Ollama instance.
     """
-    if not base_url.startswith("http://localhost") and not base_url.startswith("http://127.0.0.1"):
-        return None  # remote or LM Studio — not our responsibility
+    if not _is_local_ollama_url(base_url):
+        return None  # remote host or LM Studio — not our responsibility
 
     if _ollama_is_running(base_url):
         log.info("Ollama: already running")
@@ -2239,6 +2610,8 @@ def process_file(
     whisper_duration: int,
     whisper_skip: int,
     no_whisper: bool,
+    whisper_url: str,
+    local_whisper: bool,
     ai_api_key: Optional[str],
     local_ai_model: Optional[str],
     local_ai_url: str,
@@ -2254,6 +2627,7 @@ def process_file(
     forced_episode: Optional[dict] = None,
     precomputed_transcript: Optional[tuple[Optional[str], float]] = None,
     group_confirmed: bool = False,
+    display_window: Optional[tuple[int, int]] = None,
 ) -> dict:
     result: dict = {
         "file": mkv_path.name,
@@ -2284,7 +2658,10 @@ def process_file(
     if precomputed_transcript is not None:
         transcript, video_seconds = precomputed_transcript
     else:
-        transcript, video_seconds = get_transcript(mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper)
+        transcript, video_seconds = get_transcript(
+            mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper,
+            whisper_url, local_whisper,
+        )
     if transcript is None:
         result["status"] = "no_transcript"
         return result
@@ -2384,9 +2761,22 @@ def process_file(
                 best_ep, confidence = ai_ep, ai_conf
 
     result["confidence"] = confidence
+    # display_window narrows only this printed diagnostic, not the match itself:
+    # a disc/D<n> file's plausible episode range (see narrow_by_disc) makes for a
+    # far more readable top-N list than the whole season, but the actual scores
+    # used above for the match/confidence decision deliberately still see every
+    # episode — see the caller (process_file_group) for why that visibility
+    # matters. Falls back to the unfiltered list if nothing scored survives the
+    # window (e.g. the window itself was off) so review still has something to show.
+    display_scores = scores
+    if display_window is not None:
+        lo, hi = display_window
+        windowed = [(ep, s) for ep, s in scores if lo <= ep["number"] <= hi]
+        if windowed:
+            display_scores = windowed
     result["top_scores"] = [
         (f"S{ep['season']:02d}E{ep['number']:02d}", ep.get("name") or "", s)
-        for ep, s in scores[:3]
+        for ep, s in display_scores[:3]
     ]
     if best_ep:
         key = f"S{best_ep['season']:02d}E{best_ep['number']:02d}"
@@ -2467,7 +2857,12 @@ def process_file_group(
 
     Files the alignment can't confidently place (every candidate at/below
     QUALITY_FLOOR) get no forced pick and fall through process_file's normal
-    independent-match / AI-fallback path, same as before this existed.
+    independent-match / AI-fallback path, same as before this existed. That
+    fallback path is still bound by per_file_windows, too — each file is handed
+    only its own windowed episode subset (not the full group's candidate_episodes),
+    so a distant episode from elsewhere in the season can't out-score the real
+    match in its confidence ratio or clutter its top-N diagnostic just because it
+    happened to share some dialogue.
 
     When the alignment resolves the whole group onto one unbroken run of
     consecutive episodes with every file placed (see _alignment_is_conclusive),
@@ -2483,6 +2878,7 @@ def process_file_group(
     transcripts = [
         get_transcript_cached(
             f, args.whisper_model, whisper_duration, args.whisper_skip, args.no_whisper,
+            args.whisper_url, args.local_whisper,
             transcript_cache_dir, initial_prompt=initial_prompt,
         )
         for f in files
@@ -2494,6 +2890,18 @@ def process_file_group(
     # means the alignment matrix and the final per-file match can never fall out
     # of sync with each other (e.g. the matrix silently excluding a reference
     # subtitle as implausible while process_file's own scoring still trusted it).
+    #
+    # Note this deliberately does NOT shrink the candidate pool process_file itself
+    # scores against — only which column the alignment matrix may pick (below).
+    # process_file's own confidence ratio needs full-season visibility to keep
+    # working as a safety net: it clamps confidence to 0 whenever some other
+    # episode — including one outside this file's window — scores higher than the
+    # forced pick (see test_process_file_group_respects_per_file_window_even_under_perfect_lure).
+    # Narrowing that comparison pool to the window would silently defeat the guard
+    # (a window with a single candidate has no runner-up to lose to, so confidence
+    # would trivially max out). per_file_windows is passed through to process_file
+    # separately, purely to narrow its printed top-N diagnostic to plausible
+    # candidates — display only, doesn't change any match decision.
     matrix: list[list[float]] = []
     for row_idx, (transcript, video_seconds) in enumerate(transcripts):
         window = per_file_windows[row_idx] if per_file_windows else None
@@ -2516,8 +2924,9 @@ def process_file_group(
     group_confirmed = _alignment_is_conclusive(picks, candidate_episodes)
 
     results: list[dict] = []
-    for f, transcript_and_dur, pick in zip(files, transcripts, picks):
+    for row_idx, (f, transcript_and_dur, pick) in enumerate(zip(files, transcripts, picks)):
         forced_ep = candidate_episodes[pick] if pick is not None else None
+        window = per_file_windows[row_idx] if per_file_windows else None
         result = process_file(
             mkv_path=f,
             episodes=candidate_episodes,
@@ -2528,6 +2937,8 @@ def process_file_group(
             whisper_duration=whisper_duration,
             whisper_skip=args.whisper_skip,
             no_whisper=args.no_whisper,
+            whisper_url=args.whisper_url,
+            local_whisper=args.local_whisper,
             ai_api_key=ai_api_key,
             local_ai_model=local_ai_model,
             local_ai_url=args.local_ai_url,
@@ -2543,6 +2954,7 @@ def process_file_group(
             forced_episode=forced_ep,
             precomputed_transcript=transcript_and_dur,
             group_confirmed=group_confirmed,
+            display_window=window,
         )
         results.append(result)
     return results
@@ -2908,6 +3320,14 @@ def main() -> None:
         log.error("--local-ai and --ai-fallback are mutually exclusive; pick one.")
         sys.exit(1)
 
+    # Neither flag given: default to local AI rather than leaving AI fallback off
+    # entirely. Resolved here (post-parse), not as an argparse default on --local-ai
+    # itself, so the mutual-exclusivity check above still only fires on a genuine
+    # explicit --local-ai + --ai-fallback conflict, and --ai-fallback alone still
+    # means "use Claude, no local AI" instead of tripping that check.
+    if not args.local_ai and not args.ai_fallback:
+        local_ai_model = OLLAMA_DEFAULT_MODEL
+
     if args.ai_fallback:
         ai_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not ai_api_key:
@@ -2919,7 +3339,54 @@ def main() -> None:
         log.info("Claude AI fallback: enabled")
 
     if local_ai_model:
-        log.info(f"Local AI fallback: {local_ai_model} @ {args.local_ai_url}")
+        scope = "local" if _is_local_ollama_url(args.local_ai_url) else "remote"
+        log.info(f"Local AI fallback: {local_ai_model} @ {args.local_ai_url} ({scope})")
+
+    if args.local_whisper and not WHISPER_AVAILABLE:
+        log.error(
+            "--local-whisper requires the openai-whisper package.\n"
+            "Install it with: pip install openai-whisper\n"
+            "Or drop --local-whisper to use the remote server at --whisper-url instead."
+        )
+        sys.exit(1)
+
+    # Captured before the default-fill below so a probe-triggered fallback to
+    # local Whisper (just below) knows whether it's free to also swap in the
+    # local model name, or whether the user's explicit --whisper-model choice
+    # should be left alone even though it may not be a valid local model size.
+    whisper_model_explicit = args.whisper_model is not None
+    if args.whisper_model is None:
+        args.whisper_model = WHISPER_LOCAL_DEFAULT_MODEL if args.local_whisper else WHISPER_REMOTE_DEFAULT_MODEL
+
+    if not args.no_whisper:
+        scope = "local" if args.local_whisper else f"remote ({args.whisper_url})"
+        log.info(f"Whisper fallback: {args.whisper_model} — {scope}")
+
+    if not args.no_whisper and not args.local_whisper and args.whisper_probe_timeout > 0:
+        probe_source = find_any_video_file(scan_path)
+        log.info(f"Probing remote Whisper endpoint (timeout {args.whisper_probe_timeout}s)...")
+        if probe_remote_whisper(args.whisper_url, args.whisper_model, args.whisper_probe_timeout, probe_source):
+            log.info("Whisper probe OK")
+        elif WHISPER_AVAILABLE:
+            log.warning(
+                "Remote Whisper backend failed its readiness probe — falling back to local "
+                "Whisper for this entire run instead of aborting (slower, especially without a "
+                "local GPU, but doesn't depend on the remote server). Fix the remote server and "
+                "drop --local-whisper next time to go back to it faster; pass "
+                "--whisper-probe-timeout 0 to skip this check entirely."
+            )
+            args.local_whisper = True
+            if not whisper_model_explicit:
+                args.whisper_model = WHISPER_LOCAL_DEFAULT_MODEL
+            log.info(f"Whisper fallback: {args.whisper_model} — local")
+        else:
+            log.error(
+                "Remote Whisper backend failed its readiness probe, and openai-whisper isn't "
+                "installed locally to fall back to — install it with 'pip install openai-whisper' "
+                "to enable automatic fallback next time. Fix the remote server and retry, or pass "
+                "--whisper-probe-timeout 0 to skip this check."
+            )
+            sys.exit(1)
 
     # --- Match log directory (shared by both modes) ---
     log_dir: Optional[Path] = None
@@ -2955,7 +3422,7 @@ def main() -> None:
             "No reference subtitles available from OpenSubtitles for this season. "
             "Text matching will be skipped."
         )
-        if not args.ai_fallback and not args.local_ai:
+        if not ai_api_key and not local_ai_model:
             log.error(
                 "Cannot identify episodes without reference subtitles or an AI fallback. "
                 "Re-run with --ai-fallback (Claude) or --local-ai MODEL (Ollama/LM Studio)."
@@ -2977,6 +3444,13 @@ def main() -> None:
 
     # Highest disc number seen per season, used to estimate each disc's episode range.
     disc_totals = build_disc_totals(mkv_files, scan_path, season)
+
+    # Episodes already confidently renamed elsewhere (e.g. a prior run, or an
+    # earlier-released "part" of a season already identified) — excluded below so
+    # they're never offered to another file and, critically, so narrow_by_disc's
+    # per-disc estimate divides only the episodes actually still in play across
+    # the discs actually visible this run, not the season's full episode count.
+    already_matched_episodes = find_confidently_matched_episodes(scan_path, exclude=set(mkv_files))
 
     # --- Start Ollama if needed ---
     ollama_proc = ollama_start(args.local_ai_url) if local_ai_model else None
@@ -3009,11 +3483,19 @@ def main() -> None:
                 [ep for ep in episodes if ep["season"] == file_season]
                 if file_season is not None else episodes
             )
-            if not season_episodes:
-                log.warning(
-                    f"No episode metadata for inferred season {file_season} — "
-                    f"skipping {len(group_paths)} file(s)"
+            claimed = already_matched_episodes.get(file_season, set()) if file_season is not None else set()
+            if claimed:
+                season_episodes = [ep for ep in season_episodes if ep["number"] not in claimed]
+                log.debug(
+                    f"  Season {file_season}: excluding {len(claimed)} already-renamed "
+                    f"episode(s) from the candidate pool"
                 )
+            if not season_episodes:
+                reason = (
+                    "every episode is already confidently renamed elsewhere" if claimed
+                    else "no episode metadata for inferred season"
+                )
+                log.warning(f"Season {file_season}: {reason} — skipping {len(group_paths)} file(s)")
                 results.extend({
                     "file": p.name, "status": "skipped",
                     "matched": None, "confidence": 0.0,

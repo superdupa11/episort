@@ -22,7 +22,8 @@ def _write_srt(path: Path, text: str, span_minutes: float = 43.0) -> None:
 def _group_args(**overrides):
     defaults = dict(
         full_scan=False, whisper_model="base", whisper_duration=20, whisper_skip=60,
-        no_whisper=False, threshold=0.75, dry_run=True, alt_candidates=0, local_ai_url="",
+        no_whisper=False, whisper_url="", local_whisper=False,
+        threshold=0.75, dry_run=True, alt_candidates=0, local_ai_url="",
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
