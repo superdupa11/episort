@@ -7,8 +7,12 @@ embedded subtitles or local Whisper transcription, compares against reference
 subtitles from OpenSubtitles, and renames each file to standard S01E01 - Title.mkv
 format when confidence meets the threshold.
 
-Files below the threshold are renamed with an UNMATCHED_ prefix so they are
-visible for manual review but do not get silently lost.
+Files below the threshold are first given a second chance: once a season's files
+have all been scored, each is mapped onto its highest-scoring episode that no
+other file has claimed (status "filled"), provided that episode's raw text score
+reaches --fill-min-score. Whatever still doesn't qualify is renamed with an
+UNMATCHED_ prefix so it is visible for manual review and not silently lost.
+Pass --no-fill-unmatched to skip the second chance.
 
 Usage:
     python identifier.py "/path/to/Show/Season 1"
@@ -43,12 +47,15 @@ Optional credentials:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import io
 import json
 import logging
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -71,6 +78,19 @@ try:
     WHISPER_AVAILABLE = True
 except ImportError:
     WHISPER_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Optional dependencies for PGS subtitle OCR: Pillow (image handling) plus the
+# system `tesseract` binary (the OCR engine itself, shelled out to the same
+# way ffmpeg/ffprobe already are — no Python binding needed).
+# ---------------------------------------------------------------------------
+try:
+    from PIL import Image as _PILImage  # type: ignore
+    _PILLOW_AVAILABLE = True
+except ImportError:
+    _PILLOW_AVAILABLE = False
+_TESSERACT_AVAILABLE = shutil.which("tesseract") is not None
+OCR_LIBS_AVAILABLE = _PILLOW_AVAILABLE and _TESSERACT_AVAILABLE
 
 # ---------------------------------------------------------------------------
 # Secrets file loader
@@ -142,8 +162,8 @@ WHISPER_BASE_URL = "https://speaches.walztech.net"  # --whisper-url default; a s
 # openai-whisper identifies them by short name (its own PyTorch checkpoints) —
 # the two are different model formats, so --whisper-model can't share one
 # default across both. --local-whisper switches which of these applies.
-WHISPER_REMOTE_DEFAULT_MODEL = "Systran/faster-whisper-large-v3"
-WHISPER_LOCAL_DEFAULT_MODEL = "large-v3"
+WHISPER_REMOTE_DEFAULT_MODEL = "Systran/faster-whisper-medium"
+WHISPER_LOCAL_DEFAULT_MODEL = "medium"
 
 MIN_DURATION_SECONDS = 300       # 5 minutes — shorter clips are treated as extras
 MIN_TRANSCRIPT_WORDS = 100       # sparse transcript → probably not a full episode
@@ -165,6 +185,27 @@ JACCARD_AI_SKIP_FLOOR = 0.40     # if best raw Jaccard reaches this, the top pic
                                   # falls through to UNMATCHED for manual review rather than
                                   # being declared confident just because the raw score
                                   # cleared this floor.
+FILL_MIN_SCORE = JACCARD_AI_SKIP_FLOOR
+                                  # default floor for the fill-in pass (see _plan_fill_ins): a
+                                  # below-threshold file is only mapped onto the highest-scoring
+                                  # unclaimed episode when that episode's raw Jaccard reaches
+                                  # this. Unrelated episodes sit at a ~0.20-0.25 noise floor
+                                  # (see DECISIVE_MARGIN_FULL), so 0.40 clears noise while
+                                  # still catching a real match that the ratio-confidence
+                                  # under-rates (94.6% Jaccard at 71% confidence, say) --
+                                  # anything lower is a coin-flip better left for review.
+DECISIVE_MATCH_FLOOR = 0.60      # a best score must reach this for _margin_confidence to
+                                  # count at all -- a gap over the runner-up means little
+                                  # when the winner itself is a weak match
+DECISIVE_MARGIN_FULL = 0.60      # best-minus-runner-up gap that earns full margin
+                                  # confidence. Unrelated episodes share a ~0.20-0.25
+                                  # Jaccard noise floor of common vocabulary while a
+                                  # genuine match against OCR'd subtitles scores ~0.8-0.97,
+                                  # so a 0.45+ gap (=0.75 confidence, the default
+                                  # threshold) is unmistakable -- yet the ratio metric
+                                  # alone tops out near 0.72 there (0.95 / 0.24 = 3.9x
+                                  # against the 4x it needs), stranding decisive matches
+                                  # below threshold.
 GROUP_CONFIRMED_FLOOR = 0.85     # confidence floor granted when a multi-file disc-order
                                   # alignment resolves end-to-end with no gaps and no
                                   # unassigned files (see _alignment_is_conclusive) — several
@@ -250,6 +291,20 @@ def parse_args() -> argparse.Namespace:
                         "to effectively disable disc-based narrowing.")
     p.add_argument("--threshold", type=float, default=0.75, metavar="0.0-1.0",
                    help="Confidence required for renaming (default: 0.75)")
+    p.add_argument("--no-fill-unmatched", action="store_true",
+                   help="Leave every below-threshold file as UNMATCHED_. By default, once a "
+                        "season's files have all been scored, each file still below the "
+                        "threshold is mapped onto the highest-scoring episode that no other file "
+                        "in this run (or an earlier run) already claimed, so a file whose text "
+                        "clearly points at one episode -- but whose confidence lands just under "
+                        "the threshold because a runner-up is close -- still gets renamed. "
+                        "Those files are reported with status 'filled', not 'renamed', and their "
+                        "match log says how they were chosen.")
+    p.add_argument("--fill-min-score", type=float, default=FILL_MIN_SCORE, metavar="0.0-1.0",
+                   help="Minimum raw Jaccard score an episode needs before the fill-in pass "
+                        f"will map an unmatched file onto it (default: {FILL_MIN_SCORE}). Lower "
+                        "it to fill more aggressively (0 = always take the best unclaimed "
+                        "episode); raise it to fill only near-certain text matches.")
     p.add_argument("--dry-run", action="store_true",
                    help="Preview what would be renamed without touching files")
     p.add_argument("--whisper-model", default=None, metavar="MODEL",
@@ -269,19 +324,24 @@ def parse_args() -> argparse.Namespace:
                         "of the remote server at --whisper-url. No network dependency, but "
                         "requires openai-whisper installed locally and is typically much "
                         "slower without a local GPU.")
-    p.add_argument("--whisper-probe-timeout", type=int, default=30, metavar="SECONDS",
+    p.add_argument("--whisper-probe-timeout", type=int, default=90, metavar="SECONDS",
                    help="Before processing any files, extract a real ~1-minute clip of dialogue "
                         "from one file being scanned and send it through the real --whisper-url "
                         "transcription endpoint, waiting up to this many seconds for a response "
-                        "(default: 30). Must be real speech, not silence — a server's voice-"
+                        "(default: 90). Must be real speech, not silence — a server's voice-"
                         "activity detection filters silence (and even a pure test tone) out "
                         "before it reaches the actual model, so those return instantly even when "
                         "the real inference path is completely wedged (crashed GPU worker, "
                         "deadlocked request queue) and every real file would hang for up to an "
-                        "hour, one at a time. On failure, falls back to local Whisper for the "
-                        "whole run if openai-whisper is installed (slower, no server dependency); "
-                        "otherwise stops before wasting hours discovering this file by file. "
-                        "Ignored when --local-whisper or --no-whisper is set. Set 0 to skip.")
+                        "hour, one at a time. A single timeout is retried once before giving up — "
+                        "a backend that unloaded its model while idle (speaches does this after a "
+                        "few minutes) or just restarted needs time to reload it from disk before "
+                        "it can transcribe anything, which looks identical to wedged from the "
+                        "client side but usually clears by the second attempt. On failure after "
+                        "both attempts, falls back to local Whisper for the whole run if "
+                        "openai-whisper is installed (slower, no server dependency); otherwise "
+                        "stops before wasting hours discovering this file by file. Ignored when "
+                        "--local-whisper or --no-whisper is set. Set 0 to skip.")
     p.add_argument("--whisper-duration", type=int, default=0, metavar="MINUTES",
                    help="Minutes of audio to extract before Whisper transcription (default: 0, "
                         "meaning the full audio track — same as --full-scan). More transcribed "
@@ -299,6 +359,21 @@ def parse_args() -> argparse.Namespace:
                         "also passed --whisper-duration.")
     p.add_argument("--no-whisper", action="store_true",
                    help="Skip Whisper fallback; only process files with embedded subtitles")
+    p.add_argument("--no-ocr", action="store_true",
+                   help=f"Skip PGS (Blu-ray bitmap) subtitle OCR; image-based subtitle streams "
+                        f"fall straight through to Whisper (or get skipped entirely with "
+                        f"--no-whisper), matching this tool's behavior before OCR support "
+                        f"existed. By default, whenever a file's only embedded subtitles are "
+                        f"PGS ('hdmv_pgs_subtitle' specifically — see --check-subtitles; DVD/DVB/"
+                        f"xsub bitmap subtitles aren't supported yet and still go straight to "
+                        f"Whisper), each subtitle image is OCR'd locally with tesseract and used "
+                        f"as the transcript if it yields at least {MIN_TRANSCRIPT_WORDS} words — "
+                        f"far cheaper than transcribing a full audio track (roughly a minute or "
+                        f"two per episode, run entirely on this machine), so this always runs "
+                        f"before Whisper is invoked. Requires the tesseract system binary "
+                        f"(brew install tesseract) and the Pillow package (see requirements.txt); "
+                        f"without either, PGS subtitles are skipped exactly as before this "
+                        f"feature existed.")
     p.add_argument("--cache-dir", default=".subtitle_cache", metavar="DIR",
                    help="Where to store downloaded reference subtitles (default: .subtitle_cache)")
     p.add_argument("--alt-candidates", type=int, default=4, metavar="N",
@@ -514,9 +589,20 @@ _VIDEO_EXTENSIONS = ("*.mkv", "*.mp4", "*.m4v")
 
 
 def find_video_files(scan_path: Path, force: bool = False) -> list[Path]:
-    """Return sorted MKV/MP4 files. Already-identified files are skipped unless force=True."""
+    """
+    Return MKV/MP4 files in physical rip order. Already-identified files are
+    skipped unless force=True.
+
+    Sorted by each file's ORIGINAL name (UNMATCHED_SxxExx_YYpct_ prefix
+    stripped), not its current one: process_file_group's disc-order alignment
+    treats this order as the discs' physical title order ("Disc 1", "Disc
+    1_t01", ...). Sorting by the live filename was right on a first run but
+    scrambled every --force rerun, since a previous run's guess/confidence is
+    baked into the prefix and then dominates the sort.
+    """
     all_files = sorted(
-        f for ext in _VIDEO_EXTENSIONS for f in scan_path.rglob(ext)
+        (f for ext in _VIDEO_EXTENSIONS for f in scan_path.rglob(ext)),
+        key=lambda f: (str(f.parent), _strip_unmatched_prefix(f.stem), f.suffix),
     )
     to_process: list[Path] = []
     for f in all_files:
@@ -766,7 +852,252 @@ def extract_subtitle(mkv_path: Path, stream_index: int, out_dir: Path) -> Option
     return None
 
 
+def extract_pgs_subtitle(mkv_path: Path, stream_index: int, out_dir: Path) -> Optional[Path]:
+    """
+    Extract one PGS (bitmap) subtitle stream to a raw .sup file via stream
+    copy. PGS is an image format -- ffmpeg has no text codec to transcode it
+    into (unlike extract_subtitle's text streams), only the ability to copy
+    the compressed segments out losslessly for decode_pgs_cues to parse.
+    """
+    out = out_dir / f"sub_{stream_index}.sup"
+    r = subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "quiet",
+            "-i", str(mkv_path),
+            "-map", f"0:{stream_index}",
+            "-c", "copy",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode == 0 and out.exists() and out.stat().st_size > 50:
+        return out
+    return None
+
+
 _IMAGE_SUBTITLE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"}
+
+# v1 OCR scope is PGS only. The other three codecs above use different
+# bitmap/palette formats and, for VobSub (dvd_subtitle) specifically, need a
+# paired .sub/.idx ffmpeg extraction rather than a single stream copy --
+# meaningfully more parsing work for codecs that essentially never appear on
+# the Blu-ray rips this feature was built for. They keep falling through to
+# Whisper exactly as before OCR support existed.
+_OCR_ELIGIBLE_SUBTITLE_CODECS = {"hdmv_pgs_subtitle"}
+
+# 3 failed OCR calls in a row reads as a broken tesseract install (crashing
+# or timing out on every image), not a run of unlucky frames -- worth stopping
+# early rather than paying that cost again for every remaining cue (there can
+# be hundreds left in a stream).
+_OCR_MAX_CONSECUTIVE_FAILURES = 3
+
+
+# ---------------------------------------------------------------------------
+# 4a. PGS (.sup) decoding -- clean-room implementation
+# ---------------------------------------------------------------------------
+# The only maintained-looking Python PGS parser found (EzraBC/pgsreader) has
+# no LICENSE file, which makes vendoring or redistributing its actual source
+# ambiguous. The segment layout, RLE image encoding, and YCbCr palette below
+# are documented facts about the public Blu-ray Presentation Graphic Stream
+# bitstream format, not creative expression -- this is an independent
+# implementation of that format, verified against a real .sup file extracted
+# from an actual episode (byte-identical cue count/timestamps/dimensions and
+# visually confirmed legible subtitle text vs. the reference library).
+_PGS_PDS, _PGS_ODS, _PGS_END = 0x14, 0x15, 0x80
+
+
+def _iter_pgs_segments(data: bytes):
+    """
+    Yield (segment_type, pts_ms, payload) for each segment in raw PGS bytes.
+
+    Each segment: 2-byte 'PG' magic, 4-byte PTS (90kHz clock), 4-byte DTS,
+    1-byte type, 2-byte payload size, then the payload itself.
+    """
+    i, n = 0, len(data)
+    while i + 13 <= n:
+        if data[i:i + 2] != b"PG":
+            break  # truncated/corrupt tail -- stop rather than misparse garbage
+        pts_90khz = int.from_bytes(data[i + 2:i + 6], "big")
+        seg_type = data[i + 10]
+        size = int.from_bytes(data[i + 11:i + 13], "big")
+        payload = data[i + 13:i + 13 + size]
+        yield seg_type, pts_90khz / 90.0, payload
+        i += 13 + size
+
+
+def _decode_pgs_palette(payload: bytes) -> dict[int, tuple[int, int, int, int]]:
+    """Palette Definition Segment -> {index: (Y, Cr, Cb, Alpha)}."""
+    palette: dict[int, tuple[int, int, int, int]] = {}
+    body = payload[2:]
+    for off in range(0, len(body) - 4, 5):
+        idx, y, cr, cb, a = body[off:off + 5]
+        palette[idx] = (y, cr, cb, a)
+    return palette
+
+
+def _decode_pgs_object(payload: bytes) -> tuple[int, int, list[int]]:
+    """
+    Object Definition Segment -> (width, height, flat palette-index-per-pixel
+    list). RLE scheme: a nonzero byte is one pixel of that color. A zero byte
+    starts a control sequence read from the next byte(s): 0x00 -> end of
+    line; 0x01-0x3F -> N transparent (color 0) pixels; 0x40-0x7F -> N (14-bit)
+    transparent pixels; 0x80-0xBF -> N pixels of an explicit color; 0xC0-0xFF
+    -> N (14-bit) pixels of an explicit color.
+    """
+    width = int.from_bytes(payload[7:9], "big")
+    height = int.from_bytes(payload[9:11], "big")
+    img_data = payload[11:]
+    pixels: list[int] = []
+    i, n = 0, len(img_data)
+    while i < n:
+        b0 = img_data[i]
+        if b0 != 0:
+            pixels.append(b0)
+            i += 1
+            continue
+        b1 = img_data[i + 1]
+        if b1 == 0:
+            i += 2  # end of line -- pixels stays flat, width tells rows apart
+        elif b1 < 0x40:
+            pixels.extend([0] * b1)
+            i += 2
+        elif b1 < 0x80:
+            length = ((b1 & 0x3F) << 8) | img_data[i + 2]
+            pixels.extend([0] * length)
+            i += 3
+        elif b1 < 0xC0:
+            length = b1 & 0x3F
+            color = img_data[i + 2]
+            pixels.extend([color] * length)
+            i += 3
+        else:
+            length = ((b1 & 0x3F) << 8) | img_data[i + 2]
+            color = img_data[i + 3]
+            pixels.extend([color] * length)
+            i += 4
+    return width, height, pixels
+
+
+_PGS_YCBCR2RGB = np.array([[1, 0, 1.402], [1, -0.34414, -0.71414], [1, 1.772, 0]])
+
+
+def _make_pgs_image(width: int, height: int, pixels: list[int],
+                     palette: dict[int, tuple[int, int, int, int]]) -> "_PILImage.Image":
+    """Render a decoded PGS bitmap + palette as an RGBA Pillow image."""
+    idx = np.array(pixels[:width * height], dtype=np.uint8)
+    if idx.size < width * height:
+        idx = np.pad(idx, (0, width * height - idx.size))
+    idx = idx.reshape(height, width)
+
+    lut = np.zeros((256, 4), dtype=np.uint8)
+    for i, (y, cr, cb, a) in palette.items():
+        lut[i] = (y, cr, cb, a)
+
+    ycbcr = lut[idx][:, :, :3].astype(float)
+    ycbcr[:, :, [1, 2]] -= 128
+    rgb = ycbcr.dot(_PGS_YCBCR2RGB.T)
+    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    alpha = lut[idx][:, :, 3]
+
+    rgba = np.dstack([rgb, alpha])
+    return _PILImage.fromarray(rgba, mode="RGBA")
+
+
+def decode_pgs_cues(sup_path: Path) -> list[tuple["_PILImage.Image", float]]:
+    """
+    Decode a raw PGS .sup file into (image, start_ms) tuples, one per
+    subtitle screen that actually carries an image. Pure "clear screen"
+    display sets (which exist only to mark when the previous cue disappears)
+    are consumed but never yielded -- nothing downstream needs a cue's END
+    time or even its order beyond rough chronology (see
+    _assemble_ocr_transcript), so this is the only timing information kept.
+
+    Raises on a malformed/truncated .sup file -- callers are expected to
+    catch broadly, since a corrupt or unexpectedly-shaped subtitle stream is
+    a real, expected failure mode here, not a hypothetical one.
+    """
+    data = Path(sup_path).read_bytes()
+    cues: list[tuple["_PILImage.Image", float]] = []
+    cur_palette: dict[int, tuple[int, int, int, int]] = {}
+    cur_object: Optional[tuple[int, int, list[int]]] = None
+    cur_pts: Optional[float] = None
+    for seg_type, pts_ms, payload in _iter_pgs_segments(data):
+        if seg_type == _PGS_PDS:
+            cur_palette = _decode_pgs_palette(payload)
+        elif seg_type == _PGS_ODS:
+            cur_object = _decode_pgs_object(payload)
+            cur_pts = pts_ms
+        elif seg_type == _PGS_END:
+            if cur_object is not None and cur_palette:
+                w, h, pixels = cur_object
+                cues.append((_make_pgs_image(w, h, pixels, cur_palette), cur_pts))
+            cur_object = None
+    return cues
+
+
+_TESSERACT_TIMEOUT = 30  # seconds — one subtitle image OCRs in well under a second;
+                         # this only guards against a wedged/hung subprocess.
+
+
+def _composite_for_ocr(image: "_PILImage.Image") -> "_PILImage.Image":
+    """
+    Flatten a decoded PGS cue onto an opaque black background and convert it
+    to grayscale — the form tesseract reads accurately. PGS bitmaps are light,
+    anti-aliased text with a thin dark outline on a transparent background.
+    Handed to tesseract as-is (RGBA), or flattened onto WHITE (the "natural"
+    choice for dark-on-light OCR), real Star Trek frames came back heavily
+    garbled ("NO GUESUON aloout It." for "No question about it.") or empty
+    ("Empty page!!"); flattened onto black instead, the same frames OCR'd
+    exactly. Verified empirically against real decoded cues during development.
+    """
+    rgba = image.convert("RGBA")
+    background = _PILImage.new("RGBA", rgba.size, (0, 0, 0, 255))
+    return _PILImage.alpha_composite(background, rgba).convert("L")
+
+
+def ocr_image_with_tesseract(image: "_PILImage.Image") -> Optional[str]:
+    """
+    OCR one decoded PGS cue with the local `tesseract` binary, piping the
+    preprocessed image in over stdin (no temp file per cue — there are
+    hundreds per episode). Returns the recognized text (possibly an empty
+    string when tesseract finds none) or None when the subprocess itself
+    failed (couldn't run, timed out, non-zero exit), so callers can
+    distinguish "no text in this frame" from "OCR is broken".
+
+    --psm 6 tells tesseract to assume one uniform block of text, which fits a
+    subtitle (one or two short lines) far better than its default page-layout
+    analysis — that expects paragraphs/columns and can report "Empty page!!"
+    on a short caption.
+    """
+    buf = io.BytesIO()
+    _composite_for_ocr(image).save(buf, format="PNG")
+    try:
+        r = subprocess.run(
+            ["tesseract", "stdin", "stdout", "--psm", "6"],
+            input=buf.getvalue(), capture_output=True, timeout=_TESSERACT_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        log.error(f"  OCR: tesseract failed: {exc}")
+        return None
+    if r.returncode != 0:
+        log.error(f"  OCR: tesseract exited {r.returncode}: {r.stderr.decode('utf-8', 'replace').strip()[:200]}")
+        return None
+    return r.stdout.decode("utf-8", "replace").strip()
+
+
+def _assemble_ocr_transcript(cue_texts: list[Optional[str]]) -> str:
+    """
+    Join per-cue OCR results into one plain-text transcript, in the same
+    chronological order the cues were decoded in. No SRT reconstruction, no
+    cue numbering, no timestamps: match_score/_content_words treat a
+    transcript as an unordered bag of content words, so there's nothing
+    downstream that needs cue-level structure -- just the words, which
+    whitespace-joining preserves completely. Cues with no recognized text
+    (blank frame, OCR failure, or tesseract legitimately finding nothing)
+    contribute nothing rather than a stray blank/None entry.
+    """
+    return " ".join(t.strip() for t in cue_texts if t and t.strip())
 
 
 def check_subtitles(scan_path: Path) -> None:
@@ -796,15 +1127,21 @@ def check_subtitles(scan_path: Path) -> None:
             for s in subs:
                 lang = s.get("tags", {}).get("language", "und")
                 codec = s.get("codec_name", "?")
-                kind = "IMAGE (unusable)" if codec in _IMAGE_SUBTITLE_CODECS else "text"
+                if codec in _OCR_ELIGIBLE_SUBTITLE_CODECS:
+                    kind = "PGS (OCR)"
+                elif codec in _IMAGE_SUBTITLE_CODECS:
+                    kind = "IMAGE (unusable)"
+                else:
+                    kind = "text"
                 parts.append(f"{lang}:{codec}[{kind}]")
             desc = ", ".join(parts)
         print(f"{f.name[:55]:<55} {duration / 60:>7.1f}m  {desc}")
     print("-" * 110)
     print(
         f"{len(files)} file(s) scanned. 'text' streams are usable as-is; "
-        f"'IMAGE' streams (PGS/DVD/DVB/xsub) require OCR and are always skipped in "
-        f"favor of Whisper transcription."
+        f"'PGS' streams are OCR'd locally with tesseract (see --no-ocr) as a fast-path "
+        f"before Whisper; other 'IMAGE' streams (DVD/DVB/xsub) aren't supported yet and "
+        f"are always skipped in favor of Whisper transcription."
     )
 
 
@@ -1102,6 +1439,13 @@ def probe_remote_whisper(
     short. Falls back to a synthetic tone when no sample_source is available or
     extraction fails, which only proves the API layer and VAD are alive, not
     that the model itself still works — better than nothing, but a weaker check.
+
+    A single timeout is retried once before concluding the backend is wedged.
+    A cold backend — just started, or one that unloaded its model after being
+    idle (speaches does this after a few minutes) — needs to load the model
+    from disk before it can transcribe anything, which from the client's side
+    looks identical to a wedged one but isn't: the first attempt's wait covers
+    most of that load time, so the retry typically lands after it's done.
     """
     real_clip = False
     clip_path: Optional[Path] = None
@@ -1121,33 +1465,44 @@ def probe_remote_whisper(
         )
 
     url = base_url.rstrip("/") + "/v1/audio/transcriptions"
+    kind = "a real ~1-minute clip of dialogue" if real_clip else "a synthetic test tone"
+    max_attempts = 2
     try:
-        with open(clip_path, "rb") as f:
-            resp = requests.post(
-                url,
-                files={"file": (clip_path.name, f, "audio/wav")},
-                data={"model": model_size, "language": "en", "response_format": "verbose_json"},
-                timeout=timeout,
-            )
-        resp.raise_for_status()
-        resp.json()  # a real backend returns parseable JSON, not just a 200 with junk
-        return True
-    except requests.exceptions.ConnectionError:
-        log.error(f"Whisper probe: could not connect to {base_url}. Is the server reachable?")
-        return False
-    except requests.exceptions.Timeout:
-        kind = "a real ~1-minute clip of dialogue" if real_clip else "a synthetic test tone"
-        log.error(
-            f"Whisper probe: {base_url} did not respond within {timeout}s transcribing {kind}. "
-            "Its lightweight endpoints (health, model list) — and even non-speech audio, which "
-            "its voice-activity detection filters out before reaching the model — can look "
-            "completely fine while this hangs, so this usually means the actual speech-inference "
-            "path is wedged (crashed GPU context, deadlocked request queue)."
-        )
-        return False
-    except Exception as exc:
-        log.error(f"Whisper probe: {base_url} returned an error: {exc}")
-        return False
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with open(clip_path, "rb") as f:
+                    resp = requests.post(
+                        url,
+                        files={"file": (clip_path.name, f, "audio/wav")},
+                        data={"model": model_size, "language": "en", "response_format": "verbose_json"},
+                        timeout=timeout,
+                    )
+                resp.raise_for_status()
+                resp.json()  # a real backend returns parseable JSON, not just a 200 with junk
+                return True
+            except requests.exceptions.ConnectionError:
+                log.error(f"Whisper probe: could not connect to {base_url}. Is the server reachable?")
+                return False
+            except requests.exceptions.Timeout:
+                if attempt < max_attempts:
+                    log.warning(
+                        f"Whisper probe: {base_url} did not respond within {timeout}s transcribing "
+                        f"{kind} — may just be a cold model load rather than a wedged backend. "
+                        "Retrying once before giving up..."
+                    )
+                    continue
+                log.error(
+                    f"Whisper probe: {base_url} still hadn't responded after {attempt} attempts "
+                    f"({attempt * timeout}s total) transcribing {kind}. Its lightweight endpoints "
+                    "(health, model list) — and even non-speech audio, which its voice-activity "
+                    "detection filters out before reaching the model — can look completely fine "
+                    "while this hangs, so this usually means the actual speech-inference path is "
+                    "wedged (crashed GPU context, deadlocked request queue)."
+                )
+                return False
+            except Exception as exc:
+                log.error(f"Whisper probe: {base_url} returned an error: {exc}")
+                return False
     finally:
         clip_path.unlink(missing_ok=True)
 
@@ -1174,6 +1529,55 @@ def transcribe_audio(
     )
 
 
+def ocr_transcribe_subtitle_stream(
+    mkv_path: Path, stream_index: int, tmp_dir: Path,
+) -> Optional[str]:
+    """
+    Extract, decode, and OCR one PGS subtitle stream end-to-end, returning the
+    assembled plain-text transcript or None when the stream couldn't be turned
+    into usable text at all (extraction failed, decoding failed/produced zero
+    cues, or tesseract failed too many times in a row — see
+    _OCR_MAX_CONSECUTIVE_FAILURES). Word-count-floor rejection ("decoded fine
+    but too sparse") is the CALLER's job (get_transcript), exactly mirroring
+    how the text-subtitle loop there also does its own word-count check rather
+    than pushing that decision down into extract_subtitle/srt_to_text.
+    """
+    sup_path = extract_pgs_subtitle(mkv_path, stream_index, tmp_dir)
+    if sup_path is None:
+        return None
+    try:
+        cues = decode_pgs_cues(sup_path)
+    except Exception as exc:
+        log.warning(f"  PGS stream {stream_index}: failed to decode .sup file: {exc}")
+        return None
+    if not cues:
+        log.debug(f"  PGS stream {stream_index}: decoded 0 cues")
+        return None
+
+    log.info(f"  OCR'ing {len(cues)} subtitle image(s) from stream {stream_index} via tesseract...")
+    texts: list[Optional[str]] = []
+    consecutive_failures = 0
+    for i, (image, _start_ms) in enumerate(cues):
+        text = ocr_image_with_tesseract(image)
+        if text is None:
+            consecutive_failures += 1
+            if consecutive_failures >= _OCR_MAX_CONSECUTIVE_FAILURES:
+                log.warning(
+                    f"  PGS stream {stream_index}: {consecutive_failures} OCR calls in a row "
+                    f"failed — stopping after {i + 1}/{len(cues)} cues (tesseract broken?)"
+                )
+                break
+        else:
+            consecutive_failures = 0
+        texts.append(text)
+        if (i + 1) % 50 == 0:
+            log.debug(f"  OCR progress: {i + 1}/{len(cues)} cues")
+
+    if not any(texts):
+        return None
+    return _assemble_ocr_transcript(texts)
+
+
 # ---------------------------------------------------------------------------
 # 7. Transcript pipeline
 # ---------------------------------------------------------------------------
@@ -1186,12 +1590,13 @@ def get_transcript(
     whisper_url: str,
     local_whisper: bool,
     initial_prompt: Optional[str] = None,
+    no_ocr: bool = False,
 ) -> tuple[Optional[str], float]:
     """
-    Try embedded subtitle streams first, fall back to Whisper transcription.
-    Returns (transcript, duration_seconds). transcript is None when the file
-    should be skipped (too short, no usable content); duration_seconds is 0.0
-    in that case.
+    Try embedded text subtitles first, then OCR any PGS (image) subtitles,
+    fall back to Whisper transcription last. Returns (transcript,
+    duration_seconds). transcript is None when the file should be skipped
+    (too short, no usable content); duration_seconds is 0.0 in that case.
     """
     media_info = get_media_info(mkv_path)
     if not media_info:
@@ -1205,17 +1610,22 @@ def get_transcript(
 
     sub_streams = find_subtitle_streams(media_info)
 
-    # Separate text-based from image-based subtitle streams.
-    # PGS (hdmv_pgs_subtitle) and DVD bitmaps (dvd_subtitle) cannot be converted
-    # to text by ffmpeg — they require OCR. Only text codecs (srt, ass, subrip,
-    # webvtt, etc.) are useful here.
+    # Separate text-based from image-based subtitle streams. Only text codecs
+    # (srt, ass, subrip, webvtt, etc.) can be read directly; image-based ones
+    # (PGS, DVD/DVB bitmaps, xsub) need OCR — see _OCR_ELIGIBLE_SUBTITLE_CODECS
+    # for which of those this actually attempts today.
     text_streams = [s for s in sub_streams if s.get("codec_name") not in _IMAGE_SUBTITLE_CODECS]
     image_streams = [s for s in sub_streams if s.get("codec_name") in _IMAGE_SUBTITLE_CODECS]
+    pgs_streams = [s for s in image_streams if s.get("codec_name") in _OCR_ELIGIBLE_SUBTITLE_CODECS]
+    other_image_streams = [s for s in image_streams if s not in pgs_streams]
 
     stream_summary = f"{len(text_streams)} text"
-    if image_streams:
-        codecs = ", ".join(s.get("codec_name", "?") for s in image_streams)
-        stream_summary += f", {len(image_streams)} image-based ({codecs} — skipped)"
+    if pgs_streams:
+        ocr_note = "OCR" if (not no_ocr and OCR_LIBS_AVAILABLE) else "OCR unavailable/disabled — skipped"
+        stream_summary += f", {len(pgs_streams)} PGS ({ocr_note})"
+    if other_image_streams:
+        codecs = ", ".join(s.get("codec_name", "?") for s in other_image_streams)
+        stream_summary += f", {len(other_image_streams)} other image-based ({codecs} — skipped)"
     log.info(f"  Duration: {duration / 60:.1f} min  |  Subtitle streams: {stream_summary}")
 
     try:
@@ -1243,6 +1653,18 @@ def get_transcript(
                 log.info(f"  Using subtitle stream {idx} ({word_count} words)")
                 return text, duration
             log.debug(f"  Stream {idx}: only {word_count} words — skipping")
+
+        if not no_ocr and OCR_LIBS_AVAILABLE:
+            for stream in pgs_streams:
+                idx = stream["index"]
+                text = ocr_transcribe_subtitle_stream(mkv_path, idx, tmp_path)
+                if text is None:
+                    continue
+                word_count = len(text.split())
+                if word_count >= MIN_TRANSCRIPT_WORDS:
+                    log.info(f"  Using OCR'd PGS stream {idx} ({word_count} words)")
+                    return text, duration
+                log.debug(f"  OCR stream {idx}: only {word_count} words — skipping")
 
     if no_whisper:
         log.info("  No usable embedded subtitles and --no-whisper set. Skipping file.")
@@ -1287,6 +1709,7 @@ def build_whisper_initial_prompt(episodes: list[dict], limit: int = 40) -> Optio
 def _transcript_cache_key(
     mkv_path: Path, whisper_model: str, whisper_duration: int, whisper_skip: int,
     whisper_url: str, local_whisper: bool, initial_prompt: Optional[str],
+    no_ocr: bool = False,
 ) -> str:
     """
     Identity for a cached transcript: the file's path/size/mtime plus every
@@ -1298,6 +1721,13 @@ def _transcript_cache_key(
     of an occasional unnecessary re-transcription. The engine/URL is included
     for the same reason: --local-whisper and a remote faster-whisper-server can
     produce genuinely different text for the same model name.
+
+    no_ocr is hashed for the same reason: toggling --no-ocr changes which CODE
+    PATH produces the transcript (tesseract-OCR'd PGS subtitles vs. Whisper)
+    even when every other setting is unchanged, so serving a cached transcript
+    from the other path would silently mix the two — exactly parallel to why
+    `engine` is hashed even though whisper_model alone doesn't fully determine
+    the output.
 
     The path component is normalized through _strip_unmatched_prefix rather
     than used as-is: build_unmatched_path rewrites a file's "UNMATCHED_SxxExx_
@@ -1314,7 +1744,8 @@ def _transcript_cache_key(
     engine = "local" if local_whisper else f"remote:{whisper_url}"
     raw = (
         f"{stable_path}|{st.st_size}|{st.st_mtime}|"
-        f"{whisper_model}|{whisper_duration}|{whisper_skip}|{engine}|{initial_prompt or ''}"
+        f"{whisper_model}|{whisper_duration}|{whisper_skip}|{engine}|{initial_prompt or ''}|"
+        f"ocr:{no_ocr}"
     )
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -1329,6 +1760,7 @@ def get_transcript_cached(
     local_whisper: bool,
     transcript_cache_dir: Optional[Path],
     initial_prompt: Optional[str] = None,
+    no_ocr: bool = False,
 ) -> tuple[Optional[str], float]:
     """
     Wraps get_transcript with an on-disk cache keyed by file identity plus the
@@ -1342,12 +1774,12 @@ def get_transcript_cached(
     if transcript_cache_dir is None:
         return get_transcript(
             mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper,
-            whisper_url, local_whisper, initial_prompt,
+            whisper_url, local_whisper, initial_prompt, no_ocr,
         )
 
     key = _transcript_cache_key(
         mkv_path, whisper_model, whisper_duration, whisper_skip,
-        whisper_url, local_whisper, initial_prompt,
+        whisper_url, local_whisper, initial_prompt, no_ocr,
     )
     cache_path = transcript_cache_dir / f"{key}.json"
     if cache_path.exists():
@@ -1361,7 +1793,7 @@ def get_transcript_cached(
 
     transcript, duration = get_transcript(
         mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper,
-        whisper_url, local_whisper, initial_prompt,
+        whisper_url, local_whisper, initial_prompt, no_ocr,
     )
     if transcript is not None:
         try:
@@ -1983,6 +2415,21 @@ def _score_episodes(
     return scores
 
 
+def _margin_confidence(best_score: float, second_score: float) -> float:
+    """
+    Absolute-gap confidence (0-1): how far the best score clears the runner-up,
+    scaled so a DECISIVE_MARGIN_FULL gap is full confidence, and only for a
+    best score that is itself a real match (DECISIVE_MATCH_FLOOR). Complements
+    the ratio metric, which saturates when the winner is near 1.0 but the noise
+    floor between unrelated episodes is ~0.2 (see DECISIVE_MARGIN_FULL). Two
+    candidates that score alike -- e.g. two reference uploads that are really the
+    same text -- have no gap, so this never lifts a genuinely ambiguous pick.
+    """
+    if best_score < DECISIVE_MATCH_FLOOR:
+        return 0.0
+    return min(1.0, max(0.0, best_score - second_score) / DECISIVE_MARGIN_FULL)
+
+
 def _confidence_from_scores(scores: list[tuple[dict, float]]) -> tuple[Optional[dict], float, float]:
     """
     Derive (episode, confidence, raw_best_score) from sorted (episode, score) pairs.
@@ -2004,6 +2451,7 @@ def _confidence_from_scores(scores: list[tuple[dict, float]]) -> tuple[Optional[
     # 5× better → ~100% confidence; 2× better → ~33% confidence.
     ratio = best_score / second_score if second_score > 0 else 10.0
     confidence = min((ratio - 1.0) / 4.0, 1.0)
+    confidence = max(confidence, _margin_confidence(best_score, second_score))
 
     return best_ep, confidence, best_score
 
@@ -2046,12 +2494,18 @@ def _confidence_for_forced_pick(
     second_score = max((s for ep, s in scores if (ep["season"], ep["number"]) != fkey), default=0.0)
     ratio = forced_score / second_score if second_score > 0 else 10.0
     confidence = max(0.0, min((ratio - 1.0) / 4.0, 1.0))
+    confidence = max(confidence, _margin_confidence(forced_score, second_score))
 
-    # Group corroboration only rescues a pick the file's own text already agrees
-    # with (confidence > 0 — never the ratio<1 contradicted case above) and that
-    # clears the existing "text-supported enough" bar, so a near-empty transcript
-    # can't ride the rest of the group's coattails to a false confident match.
-    if group_confirmed and confidence > 0.0 and forced_score >= JACCARD_AI_SKIP_FLOOR:
+    # Group corroboration only rescues a pick the file's own text doesn't
+    # contradict (the forced pick at least ties the best competitor — never the
+    # ratio<1 case above) and that clears the existing "text-supported enough"
+    # bar, so a near-empty transcript can't ride the rest of the group's
+    # coattails to a false confident match. A TIE counts as uncontradicted:
+    # reference uploads are sometimes really another episode's text (seen with
+    # OpenSubtitles: E07's upload was E12's dialogue), which scores identically to
+    # the true episode's own upload and would otherwise pin confidence at 0 for
+    # exactly the files the whole-group alignment has resolved.
+    if group_confirmed and ratio >= 1.0 - 1e-9 and forced_score >= JACCARD_AI_SKIP_FLOOR:
         confidence = max(confidence, GROUP_CONFIRMED_FLOOR)
 
     return forced_ep, confidence, forced_score
@@ -2107,7 +2561,168 @@ def align_monotonic(matrix: list[list[float]], floor: float = QUALITY_FLOOR) -> 
     return picks
 
 
-def _alignment_is_conclusive(picks: list[Optional[int]], candidate_episodes: list[dict]) -> bool:
+def _alignment_score(matrix: list[list[float]], picks: list[Optional[int]], floor: float) -> float:
+    """Total (score - floor) summed over assigned rows -- the same quantity
+    align_monotonic's DP maximizes, used to compare two candidate alignments
+    against each other (see align_monotonic_bidirectional)."""
+    return sum(matrix[i][j] - floor for i, j in enumerate(picks) if j is not None)
+
+
+def align_monotonic_bidirectional(
+    matrix: list[list[float]], floor: float = QUALITY_FLOOR
+) -> list[Optional[int]]:
+    """
+    Like align_monotonic, but doesn't assume physical rip order runs in
+    ascending episode order. Some discs number their titles in the opposite
+    direction -- e.g. MakeMKV's unsuffixed title being the disc's last episode
+    with _t01.._tN counting backwards from there -- which forces every file
+    onto the wrong episode under a pure ascending assumption even when each
+    file's own text match is individually unambiguous.
+
+    Tries both orientations (rows as given, and rows reversed) and keeps
+    whichever produces the higher-scoring alignment. On a genuinely reversed
+    disc the correct-direction score wins by a wide margin (each file's true
+    match scores far above every other candidate); on a normally-ordered disc
+    the forward score wins for the same reason, so this doesn't trade away
+    accuracy on the common case. Ties keep the forward result.
+    """
+    forward = align_monotonic(matrix, floor)
+    backward = list(reversed(align_monotonic(matrix[::-1], floor)))
+    if _alignment_score(matrix, backward, floor) > _alignment_score(matrix, forward, floor):
+        return backward
+    return forward
+
+
+_UNPLACED_CLAIM_CONFIDENCE = 0.75  # margin confidence (see _margin_confidence) a row with no
+                                    # disc position needs to claim its episode outright
+
+
+def _claim_unplaced_rows(matrix: list[list[float]], unplaced_rows: list[int]) -> dict[int, int]:
+    """
+    Rows with no recoverable physical position (typically files an earlier run
+    already renamed to plain SxxExx.mkv, which no longer carry their original
+    "Disc N" name) can't join the disc-order alignment — but many state their
+    episode unmistakably on their own text. Return {row: column} for each such
+    row whose best score decisively separates from its runner-up, so the
+    alignment can drop those columns: the files that DO have a position then line
+    up against exactly the episodes still unaccounted for, which is what lets a
+    file with no usable text of its own (its episode's reference subtitle is bad)
+    still be placed by elimination instead of being wedged onto an episode that
+    was already spoken for. Two rows claiming the same column are both dropped
+    as ambiguous.
+    """
+    claims: dict[int, int] = {}
+    for r in unplaced_rows:
+        row = matrix[r]
+        if not row:
+            continue
+        order = sorted(range(len(row)), key=lambda j: row[j], reverse=True)
+        second = row[order[1]] if len(row) > 1 else 0.0
+        if _margin_confidence(row[order[0]], second) >= _UNPLACED_CLAIM_CONFIDENCE:
+            claims[r] = order[0]
+    counts: dict[int, int] = {}
+    for col in claims.values():
+        counts[col] = counts.get(col, 0) + 1
+    return {r: col for r, col in claims.items() if counts[col] == 1}
+
+
+def _align_group_rows(
+    matrix: list[list[float]], file_discs: Optional[list[Optional[int]]],
+) -> tuple[list[Optional[int]], bool, int, int]:
+    """
+    Run the disc-order alignment over a group's score matrix. Returns
+    (picks, group_confirmed, n_unplaced, n_claims): the chosen column per row
+    (None where a row has no forced pick), whether the alignment resolved its
+    rows onto one unbroken run (see _alignment_is_conclusive), and how many rows
+    were held out of the alignment / decisively claimed their own episode.
+
+    Rows with no disc marker have no recoverable physical position when other
+    rows do — typically a file a previous run already confidently renamed to
+    plain S05E16.mkv, which no longer carries its original "Disc N" name.
+    Wedging those into the disc-order alignment at an arbitrary spot force-
+    misassigns them (a correct S05E16.mkv got demoted to UNMATCHED_S05E01), so
+    they skip it and are matched on their own text like any unforced file. Those
+    that decisively identify their own episode also remove it from the pool the
+    remaining files are aligned against (_claim_unplaced_rows), so the files that
+    DO have a position line up against exactly the episodes still unaccounted for.
+    """
+    n_rows = len(matrix)
+    n_cols = len(matrix[0]) if matrix else 0
+    if file_discs is not None and any(d is not None for d in file_discs):
+        placeable = [i for i, d in enumerate(file_discs) if d is not None]
+        unplaced = [i for i, d in enumerate(file_discs) if d is None]
+        claims = _claim_unplaced_rows(matrix, unplaced)
+    else:
+        placeable, unplaced, claims = list(range(n_rows)), [], {}
+    claimed_cols = set(claims.values())
+    kept_cols = [j for j in range(n_cols) if j not in claimed_cols]
+    placed_picks = align_monotonic_bidirectional(
+        [[matrix[i][j] for j in kept_cols] for i in placeable]
+    )
+    picks: list[Optional[int]] = [None] * n_rows
+    for i, pick in zip(placeable, placed_picks):
+        picks[i] = kept_cols[pick] if pick is not None else None
+    return picks, _alignment_is_conclusive(placed_picks), len(unplaced), len(claims)
+
+
+def _reorder_disc_blocks_for_local_direction(
+    files: list[Path],
+    matrix: list[list[float]],
+    per_file_windows: Optional[list[tuple[int, int]]],
+    transcripts: list,
+    file_discs: Optional[list[Optional[int]]],
+    floor: float = QUALITY_FLOOR,
+) -> tuple[list[Path], list[list[float]], Optional[list[tuple[int, int]]], list]:
+    """
+    Some seasons have discs numbered in OPPOSITE directions from each other --
+    e.g. disc 1's titles counting down (its unsuffixed title is the disc's
+    last episode) while disc 2's titles count up normally. A season-wide
+    align_monotonic_bidirectional can only pick one direction for every row
+    in the group, so it fixes at most whichever direction most of the season
+    agrees with and still force-misassigns every file on the discs numbered
+    the other way -- even when each of those files' own text match is
+    individually unambiguous.
+
+    This runs the same forward-vs-reversed comparison align_monotonic_bidirectional
+    uses, but scoped to each disc's own contiguous run of rows independently,
+    and physically reorders a disc's block when its reversed order scores
+    higher -- before the season-wide alignment ever runs. A season with no
+    disc info (file_discs is None) is left untouched: the season-wide
+    bidirectional check afterwards already handles one undifferentiated block
+    correctly on its own, and reduces to a no-op if run here too.
+    """
+    if file_discs is None:
+        return files, matrix, per_file_windows, transcripts
+
+    files = list(files)
+    matrix = list(matrix)
+    per_file_windows = list(per_file_windows) if per_file_windows is not None else None
+    transcripts = list(transcripts)
+
+    start = 0
+    n = len(file_discs)
+    while start < n:
+        end = start
+        while end < n and file_discs[end] == file_discs[start]:
+            end += 1
+        # [start, end) is one disc's contiguous run of rows.
+        if end - start >= 2:
+            block_matrix = matrix[start:end]
+            forward_score = _alignment_score(block_matrix, align_monotonic(block_matrix, floor), floor)
+            backward_picks = list(reversed(align_monotonic(block_matrix[::-1], floor)))
+            backward_score = _alignment_score(block_matrix, backward_picks, floor)
+            if backward_score > forward_score:
+                files[start:end] = reversed(files[start:end])
+                matrix[start:end] = reversed(matrix[start:end])
+                if per_file_windows is not None:
+                    per_file_windows[start:end] = reversed(per_file_windows[start:end])
+                transcripts[start:end] = reversed(transcripts[start:end])
+        start = end
+
+    return files, matrix, per_file_windows, transcripts
+
+
+def _alignment_is_conclusive(picks: list[Optional[int]]) -> bool:
     """
     True when align_monotonic placed a clear majority of a multi-file group onto
     one unbroken run of consecutive episode numbers. This is independent
@@ -2125,13 +2740,21 @@ def _alignment_is_conclusive(picks: list[Optional[int]], candidate_episodes: lis
     coincidentally-consecutive picks buried in an otherwise-unassigned group
     can't pass — and must land on a genuinely unbroken run of episode numbers;
     a gap between two assigned rows (an episode skipped, not just a row left
-    out) still fails this. A single-file "group" carries none of that
-    corroboration (there's nothing to line up against).
+    out) still fails this. "Consecutive" is measured on the picks' column
+    indices, i.e. within whatever candidate list the alignment ran over — which
+    may have episodes already claimed elsewhere removed (see
+    _claim_unplaced_rows), so consecutive picks can skip episode NUMBERS. A single-file "group" carries none of that
+    corroboration (there's nothing to line up against). Either direction
+    counts as an unbroken run — align_monotonic_bidirectional can assign a
+    reversed-rip-order group in descending episode order just as validly as
+    the usual ascending one.
     """
-    assigned = [candidate_episodes[p]["number"] for p in picks if p is not None]
+    assigned = [p for p in picks if p is not None]
     if len(assigned) < 2 or len(assigned) <= len(picks) / 2:
         return False
-    return all(b == a + 1 for a, b in zip(assigned, assigned[1:]))
+    ascending = all(b == a + 1 for a, b in zip(assigned, assigned[1:]))
+    descending = all(b == a - 1 for a, b in zip(assigned, assigned[1:]))
+    return ascending or descending
 
 
 def match_by_text(
@@ -2527,8 +3150,10 @@ def write_match_log(
     final_match: Optional[dict],
     confidence: float,
     video_seconds: float = 0.0,
+    note: Optional[str] = None,
 ) -> None:
-    """Write a human-readable match log for one video file to log_dir/Show/Season N/."""
+    """Write a human-readable match log for one video file to log_dir/Show/Season N/.
+    `note`, when given, is printed under the Result line (e.g. how a fill-in pick was made)."""
     try:
         safe_show = re.sub(r'[\\/:*?"<>|]', "_", show_name).strip()
         season_num = (
@@ -2558,6 +3183,8 @@ def write_match_log(
                 fh.write(f"{key} - {final_match.get('name', '')}  ({confidence:.0%} confidence)\n")
             else:
                 fh.write(f"UNMATCHED  ({confidence:.0%})\n")
+            if note:
+                fh.write(f"Note:    {note}\n")
             fh.write(f"{sep}\n\n")
 
             fh.write(f"TRANSCRIPT ({len((transcript or '').split())} words)\n")
@@ -2628,7 +3255,18 @@ def process_file(
     precomputed_transcript: Optional[tuple[Optional[str], float]] = None,
     group_confirmed: bool = False,
     display_window: Optional[tuple[int, int]] = None,
+    no_ocr: bool = False,
+    defer_unmatched: bool = False,
 ) -> dict:
+    """
+    Identify one video file and rename it (SxxExx when confident, UNMATCHED_ otherwise).
+
+    defer_unmatched: a file that ends up below threshold is neither renamed nor
+    logged here -- its result carries a "pending" entry instead (path, best guess,
+    full ranked scores, the write_match_log kwargs) for process_file_group's
+    fill-in pass (see _settle_unmatched), which needs every sibling file scored
+    first to know which episodes are really still unclaimed.
+    """
     result: dict = {
         "file": mkv_path.name,
         "status": "skipped",
@@ -2660,7 +3298,7 @@ def process_file(
     else:
         transcript, video_seconds = get_transcript(
             mkv_path, whisper_model, whisper_duration, whisper_skip, no_whisper,
-            whisper_url, local_whisper,
+            whisper_url, local_whisper, no_ocr=no_ocr,
         )
     if transcript is None:
         result["status"] = "no_transcript"
@@ -2784,6 +3422,19 @@ def process_file(
         result["matched"] = f"{key} - {title}" if title else key
         log.info(f"  Best match: {result['matched']}  ({confidence:.1%} confidence)")
 
+    log_kwargs = dict(
+        log_dir=log_dir,
+        video_path=mkv_path,
+        show_name=show_name,
+        transcript=transcript,
+        scores=scores,
+        ai_prompt=ai_prompt,
+        ai_response=ai_response,
+        final_match=best_ep,
+        confidence=confidence,
+        video_seconds=video_seconds,
+    )
+
     # Step 3: rename or mark unmatched
     if confidence >= threshold and best_ep:
         target = build_confident_path(mkv_path, best_ep)
@@ -2792,6 +3443,18 @@ def process_file(
         if renamed and matched_this_run is not None:
             ep_key = f"S{best_ep['season']:02d}E{best_ep['number']:02d}"
             matched_this_run.add(ep_key)
+    elif defer_unmatched:
+        log.info(f"  Below threshold ({confidence:.1%} < {threshold:.1%}) — held for the fill-in pass")
+        result["status"] = "unmatched"
+        result["pending"] = {
+            "path": mkv_path,
+            "best_ep": best_ep,
+            "confidence": confidence,
+            "scores": scores,
+            "window": display_window,
+            "log_kwargs": log_kwargs,
+        }
+        return result
     else:
         log.info(f"  Below threshold ({confidence:.1%} < {threshold:.1%}) — marking UNMATCHED")
         target = build_unmatched_path(mkv_path, best_ep, confidence)
@@ -2799,20 +3462,114 @@ def process_file(
         result["status"] = "unmatched"
 
     if log_dir is not None:
-        write_match_log(
-            log_dir=log_dir,
-            video_path=mkv_path,
-            show_name=show_name,
-            transcript=transcript,
-            scores=scores,
-            ai_prompt=ai_prompt,
-            ai_response=ai_response,
-            final_match=best_ep,
-            confidence=confidence,
-            video_seconds=video_seconds,
-        )
+        write_match_log(**log_kwargs)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# 13a. Fill-in pass for below-threshold files
+# ---------------------------------------------------------------------------
+def _plan_fill_ins(
+    candidates: list[tuple[int, list[tuple[dict, float]], Optional[tuple[int, int]]]],
+    claimed: set[str],
+    min_score: float,
+) -> dict[int, tuple[dict, float]]:
+    """
+    Map each below-threshold file onto its highest-scoring episode that nothing
+    else has claimed. `candidates` is [(row, ranked_scores, window)] where
+    ranked_scores is the file's own (episode, jaccard) list and window, if any,
+    is the (min, max) episode-number range that file is bounded to (the same hard
+    bound the alignment honors, so the fill can't pull a file outside its disc).
+    `claimed` holds "SxxExx" keys already taken. Returns {row: (episode, score)}
+    for the files that got one; the rest stay unmatched.
+
+    Files compete for episodes by score, best pair first: every eligible
+    (file, episode) pair is ranked by Jaccard and taken greedily, skipping any
+    whose file or episode is already used. So when two files both want the same
+    episode the stronger text match keeps it and the other falls to its own
+    next-highest unclaimed one -- rather than whichever file happened to be
+    processed first winning. Pairs under min_score never qualify (see
+    FILL_MIN_SCORE), so a file with no real text support is left for review
+    instead of being mapped onto whatever episode is left over.
+    """
+    pairs = []
+    for row, scores, window in candidates:
+        for ep, score in scores:
+            if score < min_score:
+                continue
+            if f"S{ep['season']:02d}E{ep['number']:02d}" in claimed:
+                continue
+            if window is not None and not (window[0] <= ep["number"] <= window[1]):
+                continue
+            pairs.append((-score, row, ep["season"], ep["number"], ep))
+    pairs.sort(key=lambda p: p[:4])
+
+    plan: dict[int, tuple[dict, float]] = {}
+    used: set[tuple[int, int]] = set()
+    for neg_score, row, season, number, ep in pairs:
+        if row in plan or (season, number) in used:
+            continue
+        plan[row] = (ep, -neg_score)
+        used.add((season, number))
+    return plan
+
+
+def _settle_unmatched(
+    results: list[dict],
+    claimed: set[str],
+    min_score: float,
+    dry_run: bool,
+    pending_renames: list,
+    processing_paths: set,
+) -> None:
+    """
+    Second pass over a group's results, for the files process_file held back
+    (defer_unmatched): rename each onto its planned fill-in episode (status
+    "filled"), or to the usual UNMATCHED_ name when none qualifies. Runs only
+    after every file in the group has had its own chance at a confident match,
+    so a fill can never take an episode a later file would have matched outright
+    -- `claimed` (the run's matched_this_run) already holds all of those.
+    Mutates `results` in place and adds each filled episode to `claimed`.
+    """
+    held = [(i, r["pending"]) for i, r in enumerate(results) if "pending" in r]
+    if not held:
+        return
+
+    plan = _plan_fill_ins([(i, p["scores"], p["window"]) for i, p in held], claimed, min_score)
+    for i, p in held:
+        result = results[i]
+        result.pop("pending")
+        path: Path = p["path"]
+        picked = plan.get(i)
+
+        if picked is not None:
+            ep, score = picked
+            key = f"S{ep['season']:02d}E{ep['number']:02d}"
+            skipped = [
+                f"S{e['season']:02d}E{e['number']:02d}" for e, s in p["scores"]
+                if s > score and f"S{e['season']:02d}E{e['number']:02d}" in claimed
+            ]
+            note = (
+                f"Below threshold ({p['confidence']:.0%} confidence), so filled with the "
+                f"highest-scoring unclaimed episode ({score:.1%} Jaccard)"
+                + (f"; higher-scoring {', '.join(skipped)} already taken" if skipped else "")
+            )
+            log.info(f"\n[{path.name}]\n  Fill-in: {key} ({score:.1%} Jaccard) — {note}")
+            if do_rename(path, build_confident_path(path, ep), dry_run, pending_renames, processing_paths):
+                claimed.add(key)
+                result["status"] = "filled"
+                result["matched"] = f"{key} - {ep['name']}" if ep.get("name") else key
+                result["fill_score"] = score
+                if p["log_kwargs"]["log_dir"] is not None:
+                    write_match_log(**{**p["log_kwargs"], "final_match": ep, "note": note})
+                continue
+
+        if picked is None:
+            log.info(f"\n[{path.name}]\n  No unclaimed episode reaches {min_score:.0%} — marking UNMATCHED")
+        do_rename(path, build_unmatched_path(path, p["best_ep"], p["confidence"]), dry_run)
+        if p["log_kwargs"]["log_dir"] is not None:
+            write_match_log(**p["log_kwargs"])
 
 
 # ---------------------------------------------------------------------------
@@ -2834,6 +3591,7 @@ def process_file_group(
     log_dir: Optional[Path],
     os_token: Optional[str] = None,
     per_file_windows: Optional[list[tuple[int, int]]] = None,
+    file_discs: Optional[list[Optional[int]]] = None,
 ) -> list[dict]:
     """
     Process a set of files expected to be in physical rip order (one disc, or an
@@ -2864,12 +3622,23 @@ def process_file_group(
     match in its confidence ratio or clutter its top-N diagnostic just because it
     happened to share some dialogue.
 
+    file_discs (same order as `files`) lets each disc's own contiguous run of
+    rows get independently corrected for reversed title numbering before the
+    season-wide alignment runs — see _reorder_disc_blocks_for_local_direction.
+    Without it (e.g. the flat-folder --series-review path, which has no disc
+    concept), only the season-wide align_monotonic_bidirectional flip applies.
+
     When the alignment resolves the whole group onto one unbroken run of
     consecutive episodes with every file placed (see _alignment_is_conclusive),
     that agreement is passed to every file in the group as group_confirmed,
     granting a confidence floor (GROUP_CONFIRMED_FLOOR) on top of each file's own
     ratio-confidence — several files' rip order lining up end-to-end with the
     season's order is real evidence a single file's ratio score can't capture.
+
+    Files still below threshold after all of that are not renamed straight away
+    (unless --no-fill-unmatched): once every file has been scored, each is mapped
+    onto its highest-scoring episode that no file in the run has claimed —
+    see _plan_fill_ins / _settle_unmatched.
     """
     candidate_episodes = sorted(candidate_episodes, key=lambda ep: ep["number"])
     whisper_duration = 0 if args.full_scan else args.whisper_duration
@@ -2880,6 +3649,7 @@ def process_file_group(
             f, args.whisper_model, whisper_duration, args.whisper_skip, args.no_whisper,
             args.whisper_url, args.local_whisper,
             transcript_cache_dir, initial_prompt=initial_prompt,
+            no_ocr=args.no_ocr,
         )
         for f in files
     ]
@@ -2920,8 +3690,17 @@ def process_file_group(
             row.append(file_scores.get((ep["season"], ep["number"]), 0.0))
         matrix.append(row)
 
-    picks = align_monotonic(matrix)
-    group_confirmed = _alignment_is_conclusive(picks, candidate_episodes)
+    files, matrix, per_file_windows, transcripts = _reorder_disc_blocks_for_local_direction(
+        files, matrix, per_file_windows, transcripts, file_discs,
+    )
+
+    picks, group_confirmed, n_unplaced, n_claims = _align_group_rows(matrix, file_discs)
+    if n_unplaced:
+        log.info(
+            f"  {n_unplaced} file(s) without a disc position skip the disc-order alignment; "
+            f"{n_claims} of them decisively identify their own episode, which is removed "
+            f"from the alignment's candidate pool"
+        )
 
     results: list[dict] = []
     for row_idx, (f, transcript_and_dur, pick) in enumerate(zip(files, transcripts, picks)):
@@ -2955,8 +3734,16 @@ def process_file_group(
             precomputed_transcript=transcript_and_dur,
             group_confirmed=group_confirmed,
             display_window=window,
+            no_ocr=args.no_ocr,
+            defer_unmatched=not args.no_fill_unmatched,
         )
         results.append(result)
+
+    if not args.no_fill_unmatched:
+        _settle_unmatched(
+            results, matched_this_run, args.fill_min_score, args.dry_run,
+            pending_renames, processing_paths,
+        )
     return results
 
 
@@ -3388,6 +4175,22 @@ def main() -> None:
             )
             sys.exit(1)
 
+    if not args.no_ocr:
+        if OCR_LIBS_AVAILABLE:
+            log.info("PGS subtitle OCR: tesseract (local)")
+        else:
+            missing = []
+            if not _PILLOW_AVAILABLE:
+                missing.append("Pillow (pip install pillow)")
+            if not _TESSERACT_AVAILABLE:
+                missing.append("tesseract (brew install tesseract)")
+            log.warning(
+                f"PGS subtitle OCR is enabled by default but {' and '.join(missing)} isn't "
+                "installed — image-based (PGS) subtitle streams will fall through to Whisper "
+                "transcription instead, same as before this feature existed. Install the "
+                "missing piece (see requirements.txt), or pass --no-ocr to silence this warning."
+            )
+
     # --- Match log directory (shared by both modes) ---
     log_dir: Optional[Path] = None
     if args.log_dir is not None:
@@ -3560,6 +4363,7 @@ def main() -> None:
                 processing_paths=processing_paths,
                 log_dir=log_dir,
                 per_file_windows=per_file_windows,
+                file_discs=[file_disc[p] for p in group_paths],
             )
             results.extend(group_results)
 

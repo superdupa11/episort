@@ -51,6 +51,182 @@ def test_align_monotonic_empty_inputs():
 
 
 # ---------------------------------------------------------------------------
+# align_monotonic_bidirectional
+# ---------------------------------------------------------------------------
+def test_align_monotonic_bidirectional_prefers_forward_on_normal_rip():
+    #        E04   E05   E06
+    matrix = [
+        [0.60, 0.05, 0.05],
+        [0.05, 0.55, 0.05],
+        [0.05, 0.05, 0.50],
+    ]
+    assert I.align_monotonic_bidirectional(matrix) == [0, 1, 2]
+
+
+def test_align_monotonic_bidirectional_detects_reversed_rip_order():
+    # Files physically ripped in descending episode order (e.g. MakeMKV's
+    # unsuffixed title being the disc's last episode, _t01.._tN counting
+    # backwards) -- each file's own match is unambiguous, but a pure ascending
+    # assumption would force every file onto the wrong episode.
+    #        E04   E05   E06
+    matrix = [
+        [0.05, 0.05, 0.60],
+        [0.05, 0.55, 0.05],
+        [0.50, 0.05, 0.05],
+    ]
+    assert I.align_monotonic_bidirectional(matrix) == [2, 1, 0]
+
+
+def test_align_monotonic_bidirectional_matches_plain_version_when_unambiguous_forward():
+    # Same fixture as test_align_monotonic_resolves_order_ambiguity -- the
+    # bidirectional wrapper shouldn't change behavior on an already-correct
+    # forward rip just because it now also checks the reverse.
+    matrix = [
+        [0.05, 0.55, 0.10, 0.05, 0.05],
+        [0.05, 0.35, 0.30, 0.05, 0.05],
+        [0.05, 0.05, 0.10, 0.50, 0.05],
+    ]
+    assert I.align_monotonic_bidirectional(matrix) == I.align_monotonic(matrix)
+
+
+# ---------------------------------------------------------------------------
+# _reorder_disc_blocks_for_local_direction
+# ---------------------------------------------------------------------------
+def _pf(*names):
+    return [Path(f"/x/{n}.mkv") for n in names]
+
+
+def test_reorder_disc_blocks_fixes_one_reversed_disc_among_normal_ones():
+    # Disc 1's titles count DOWN (E03,E02,E01) while disc 2's count up
+    # normally (E04,E05,E06) -- a season-wide bidirectional flip can only
+    # pick one direction for everything, so this needs the per-disc fix.
+    #                E01   E02   E03   E04   E05   E06
+    matrix = [
+        [0.05, 0.05, 0.60, 0.05, 0.05, 0.05],  # disc 1, row 0 -> true E03
+        [0.05, 0.60, 0.05, 0.05, 0.05, 0.05],  # disc 1, row 1 -> true E02
+        [0.60, 0.05, 0.05, 0.05, 0.05, 0.05],  # disc 1, row 2 -> true E01
+        [0.05, 0.05, 0.05, 0.60, 0.05, 0.05],  # disc 2, row 0 -> true E04
+        [0.05, 0.05, 0.05, 0.05, 0.60, 0.05],  # disc 2, row 1 -> true E05
+        [0.05, 0.05, 0.05, 0.05, 0.05, 0.60],  # disc 2, row 2 -> true E06
+    ]
+    files = _pf("d1_base", "d1_t01", "d1_t02", "d2_base", "d2_t01", "d2_t02")
+    file_discs = [1, 1, 1, 2, 2, 2]
+    transcripts = [(f"transcript {i}", 0.0) for i in range(6)]
+
+    new_files, new_matrix, _, new_transcripts = I._reorder_disc_blocks_for_local_direction(
+        files, matrix, None, transcripts, file_discs,
+    )
+
+    # Disc 1's block is physically reversed; disc 2's is left alone.
+    assert [f.name for f in new_files] == [
+        "d1_t02.mkv", "d1_t01.mkv", "d1_base.mkv", "d2_base.mkv", "d2_t01.mkv", "d2_t02.mkv",
+    ]
+    assert new_transcripts == [transcripts[2], transcripts[1], transcripts[0],
+                                transcripts[3], transcripts[4], transcripts[5]]
+    # After reordering, feeding this into the normal aligner resolves ascending.
+    picks = I.align_monotonic_bidirectional(new_matrix)
+    assert picks == [0, 1, 2, 3, 4, 5]
+
+
+def test_reorder_disc_blocks_noop_without_disc_info():
+    files = _pf("a", "b")
+    matrix = [[0.6, 0.05], [0.05, 0.6]]
+    transcripts = ["t0", "t1"]
+    result = I._reorder_disc_blocks_for_local_direction(files, matrix, None, transcripts, None)
+    assert result == (files, matrix, None, transcripts)
+
+
+def test_reorder_disc_blocks_leaves_single_file_disc_alone():
+    # A lone file on its own disc has nothing to reorder against.
+    files = _pf("solo")
+    matrix = [[0.05, 0.6, 0.05]]
+    transcripts = ["t0"]
+    new_files, new_matrix, _, new_transcripts = I._reorder_disc_blocks_for_local_direction(
+        files, matrix, None, transcripts, [1],
+    )
+    assert new_files == files
+    assert new_matrix == matrix
+    assert new_transcripts == transcripts
+
+
+def test_reorder_disc_blocks_keeps_per_file_windows_in_lockstep():
+    matrix = [
+        [0.05, 0.60],  # -> true E02
+        [0.60, 0.05],  # -> true E01
+    ]
+    files = _pf("t01", "t02")
+    windows = [(1, 2), (1, 2)]
+    transcripts = ["a", "b"]
+    new_files, new_matrix, new_windows, new_transcripts = I._reorder_disc_blocks_for_local_direction(
+        files, matrix, windows, transcripts, [1, 1],
+    )
+    assert [f.name for f in new_files] == ["t02.mkv", "t01.mkv"]
+    assert new_windows == [(1, 2), (1, 2)]  # identical windows here, but list stays aligned
+    assert new_transcripts == ["b", "a"]
+
+
+# ---------------------------------------------------------------------------
+# _claim_unplaced_rows
+# ---------------------------------------------------------------------------
+def test_claim_unplaced_rows_claims_only_decisive_rows():
+    #        E01   E02   E03
+    matrix = [
+        [0.95, 0.22, 0.20],  # row 0: unmistakably E01
+        [0.55, 0.50, 0.20],  # row 1: weak and clustered -- no claim
+        [0.20, 0.30, 0.90],  # row 2: placed (not in unplaced list) -- never considered
+    ]
+    assert I._claim_unplaced_rows(matrix, [0, 1]) == {0: 0}
+
+
+def test_claim_unplaced_rows_drops_ambiguous_double_claims():
+    # Two files both decisively claim E02 -- one of them is wrong, and there's
+    # no telling which, so neither may pull that episode out of the pool.
+    matrix = [
+        [0.20, 0.95, 0.20],
+        [0.20, 0.93, 0.25],
+    ]
+    assert I._claim_unplaced_rows(matrix, [0, 1]) == {}
+
+
+# ---------------------------------------------------------------------------
+# _align_group_rows
+# ---------------------------------------------------------------------------
+def _group_matrix():
+    #            E01   E02   E03   E04   E05
+    return [
+        [0.20, 0.95, 0.20, 0.20, 0.20],  # row 0: no disc position, decisively E02
+        [0.20, 0.20, 0.20, 0.95, 0.20],  # row 1: no disc position, decisively E04
+        [0.95, 0.20, 0.20, 0.20, 0.20],  # row 2: disc file, E01
+        [0.20, 0.20, 0.25, 0.35, 0.20],  # row 3: disc file, no real match; leans toward E04
+        [0.20, 0.20, 0.20, 0.20, 0.95],  # row 4: disc file, E05
+    ]
+
+
+def test_align_group_rows_places_a_textless_file_by_elimination():
+    # E02 and E04 are spoken for by rows 0/1, so the three disc files line up against
+    # exactly E01, E03, E05 -- row 3 (whose text resembles the claimed E04) lands on
+    # E03 by elimination instead of being wedged onto an already-identified episode.
+    picks, confirmed, n_unplaced, n_claims = I._align_group_rows(_group_matrix(), [None, None, 1, 1, 1])
+    assert picks == [None, None, 0, 2, 4]
+    assert confirmed is True   # 3 rows, one unbroken run in the reduced candidate list
+    assert (n_unplaced, n_claims) == (2, 2)
+
+
+def test_align_group_rows_without_claims_the_same_file_takes_a_claimed_episode():
+    # Documents what the claims prevent: aligned against ALL five episodes, row 3
+    # would take E04 (its weak lean) -- the episode row 1 already identifies.
+    picks, confirmed, _, _ = I._align_group_rows(_group_matrix()[2:], [1, 1, 1])
+    assert picks[1] == 3
+    assert confirmed is False  # E01, E04, E05: skips episodes -> not an unbroken run
+
+
+def test_align_group_rows_with_no_disc_info_aligns_every_row():
+    matrix = [[0.9, 0.2], [0.2, 0.9]]
+    assert I._align_group_rows(matrix, None) == ([0, 1], True, 0, 0)
+    assert I._align_group_rows(matrix, [None, None]) == ([0, 1], True, 0, 0)
+
+
+# ---------------------------------------------------------------------------
 # _alignment_is_conclusive
 # ---------------------------------------------------------------------------
 def _eps(*numbers):
@@ -58,34 +234,38 @@ def _eps(*numbers):
 
 
 def test_alignment_is_conclusive_true_for_unbroken_run():
-    candidates = _eps(9, 10, 11, 12, 13, 14)
     picks = [0, 1, 2, 3, 4, 5]
-    assert I._alignment_is_conclusive(picks, candidates) is True
+    assert I._alignment_is_conclusive(picks) is True
+
+
+def test_alignment_is_conclusive_true_for_unbroken_descending_run():
+    # A reversed-rip-order group (see align_monotonic_bidirectional) lands on
+    # a descending run of episode numbers -- still one unbroken run, so this
+    # should count as conclusive just like the ascending case.
+    picks = [5, 4, 3, 2, 1, 0]
+    assert I._alignment_is_conclusive(picks) is True
 
 
 def test_alignment_is_conclusive_false_for_single_file():
-    candidates = _eps(9)
-    assert I._alignment_is_conclusive([0], candidates) is False
+    assert I._alignment_is_conclusive([0]) is False
 
 
 def test_alignment_is_conclusive_false_when_unassigned_row_leaves_a_gap():
     # Row 1 unassigned, but the assigned rows land on E09 then E11 -- a gap
     # (E10 skipped), not one unbroken run, so this stays inconclusive even
     # though the unassigned row itself is now tolerated on its own.
-    candidates = _eps(9, 10, 11)
     picks = [0, None, 2]
-    assert I._alignment_is_conclusive(picks, candidates) is False
+    assert I._alignment_is_conclusive(picks) is False
 
 
 def test_alignment_is_conclusive_false_when_episode_skipped():
     # Picks land on E09 then E11 -- a gap (E10 skipped), not one unbroken run.
-    candidates = _eps(9, 10, 11)
     picks = [0, 2]
-    assert I._alignment_is_conclusive(picks, candidates) is False
+    assert I._alignment_is_conclusive(picks) is False
 
 
 def test_alignment_is_conclusive_false_for_empty_picks():
-    assert I._alignment_is_conclusive([], _eps(9)) is False
+    assert I._alignment_is_conclusive([]) is False
 
 
 def test_alignment_is_conclusive_true_despite_unassigned_duplicate_titles():
@@ -93,18 +273,16 @@ def test_alignment_is_conclusive_true_despite_unassigned_duplicate_titles():
     # that lost its column to a stronger row) -- the real-world MakeMKV
     # situation this tolerance exists for. The assigned majority still forms
     # an unbroken run, so this should now read as confirmed.
-    candidates = _eps(9, 10, 11, 12)
     picks = [0, None, 1, 2, 3]
-    assert I._alignment_is_conclusive(picks, candidates) is True
+    assert I._alignment_is_conclusive(picks) is True
 
 
 def test_alignment_is_conclusive_false_when_assigned_rows_are_not_a_majority():
     # Only 2 of 10 rows assigned, even though those two happen to be
     # consecutive -- too little of the group actually lined up to count as
     # independent corroboration.
-    candidates = _eps(9, 10)
     picks = [None, None, None, None, None, None, None, None, 0, 1]
-    assert I._alignment_is_conclusive(picks, candidates) is False
+    assert I._alignment_is_conclusive(picks) is False
 
 
 # ---------------------------------------------------------------------------
@@ -173,21 +351,62 @@ def test_confidence_for_forced_pick_empty_scores():
 
 
 def test_confidence_for_forced_pick_group_confirmed_boosts_mediocre_ratio():
-    # Mirrors the real Yellowstone S05 case: ~86% Jaccard vs. a ~23% runner-up
-    # is a ~3.7x ratio -- comfortably below the 4x the plain ratio formula
-    # needs for 75% confidence, even though the pick is unambiguous.
+    # A middling-but-real match (0.50 vs a 0.30 runner-up: 1.7x, and below the
+    # decisive-match floor so the margin rule doesn't apply): text alone stays
+    # well short of confident, but the whole disc lining up end-to-end is
+    # independent evidence that should lift it.
     scores = [
-        ({"season": 5, "number": 9}, 0.869),
-        ({"season": 5, "number": 7}, 0.230),
-        ({"season": 5, "number": 12}, 0.234),
+        ({"season": 5, "number": 9}, 0.50),
+        ({"season": 5, "number": 7}, 0.30),
+        ({"season": 5, "number": 12}, 0.28),
     ]
     forced = {"season": 5, "number": 9}
     ep, conf_plain, _ = I._confidence_for_forced_pick(scores, forced)
     assert conf_plain < I.GROUP_CONFIRMED_FLOOR
     ep, conf_boosted, raw = I._confidence_for_forced_pick(scores, forced, group_confirmed=True)
     assert ep == forced
-    assert raw == 0.869
+    assert raw == 0.50
     assert conf_boosted == I.GROUP_CONFIRMED_FLOOR
+
+
+def test_decisive_margin_is_confident_without_group_confirmation():
+    # Mirrors real OCR results: ~0.87-0.97 against a ~0.23 noise floor is only
+    # a ~3.7-4.2x ratio, which the plain ratio formula caps at ~70% -- below the
+    # 75% threshold -- even though nothing else comes close. The absolute gap
+    # (0.63) makes it unmistakable.
+    scores = [
+        ({"season": 5, "number": 9}, 0.869),
+        ({"season": 5, "number": 7}, 0.230),
+        ({"season": 5, "number": 12}, 0.234),
+    ]
+    ep, conf, raw = I._confidence_from_scores(scores)
+    assert ep["number"] == 9 and raw == 0.869
+    assert conf >= 0.75
+    forced = {"season": 5, "number": 9}
+    assert I._confidence_for_forced_pick(scores, forced)[1] >= 0.75
+
+
+def test_margin_confidence_never_lifts_a_clustered_or_weak_pick():
+    # Two candidates that score alike (e.g. two reference uploads that are the
+    # same text) have no gap; a weak winner has nothing to be decisive about.
+    assert I._margin_confidence(0.87, 0.85) < 0.1
+    assert I._margin_confidence(0.55, 0.05) == 0.0  # below DECISIVE_MATCH_FLOOR
+    assert I._margin_confidence(0.95, 0.25) == 1.0
+
+
+def test_confidence_for_forced_pick_group_confirmed_rescues_an_exact_tie():
+    # OpenSubtitles sometimes serves another episode's dialogue as an episode's
+    # reference (seen: E07's upload was E12's text), so the true episode and the
+    # imposter tie EXACTLY. A tie isn't the text contradicting the alignment, so
+    # group confirmation must be able to rescue it -- unlike the ratio<1 case.
+    scores = [
+        ({"season": 5, "number": 7}, 0.869),   # imposter reference, ties the true one
+        ({"season": 5, "number": 12}, 0.869),  # the order-consistent pick
+        ({"season": 5, "number": 3}, 0.22),
+    ]
+    forced = {"season": 5, "number": 12}
+    assert I._confidence_for_forced_pick(scores, forced)[1] == 0.0
+    assert I._confidence_for_forced_pick(scores, forced, group_confirmed=True)[1] == I.GROUP_CONFIRMED_FLOOR
 
 
 def test_confidence_for_forced_pick_group_confirmed_does_not_rescue_contradicted_pick():
@@ -414,3 +633,58 @@ def test_match_with_local_ai_falls_back_to_raw_text_on_non_json_error_body(monke
         )
     assert ep is None and conf == 0.0
     assert "local-ai matching failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# _plan_fill_ins
+# ---------------------------------------------------------------------------
+def _eps(*numbers, season=5):
+    return {n: {"season": season, "number": n, "name": f"Ep{n}"} for n in numbers}
+
+
+def _ranked(eps, scores):
+    """[(episode, score)] sorted best-first, from {episode_number: score}."""
+    return sorted(((eps[n], s) for n, s in scores.items()), key=lambda x: x[1], reverse=True)
+
+
+def test_plan_fill_ins_takes_next_highest_unclaimed_episode():
+    eps = _eps(23, 24, 25)
+    ranked = _ranked(eps, {24: 0.95, 23: 0.60, 25: 0.15})
+    plan = I._plan_fill_ins([(0, ranked, None)], claimed={"S05E24"}, min_score=0.40)
+    assert plan[0][0]["number"] == 23  # E24 is spoken for -> next highest, not E25
+
+
+def test_plan_fill_ins_leaves_file_unmatched_when_nothing_clears_the_floor():
+    eps = _eps(23, 24)
+    ranked = _ranked(eps, {24: 0.95, 23: 0.30})
+    assert I._plan_fill_ins([(0, ranked, None)], {"S05E24"}, min_score=0.40) == {}
+
+
+def test_plan_fill_ins_stronger_text_match_keeps_a_contested_episode():
+    eps = _eps(23, 24)
+    weak = _ranked(eps, {24: 0.72, 23: 0.55})
+    strong = _ranked(eps, {24: 0.95, 23: 0.10})
+    # The weaker file is listed FIRST -- processing order must not decide it.
+    plan = I._plan_fill_ins([(0, weak, None), (1, strong, None)], set(), min_score=0.40)
+    assert plan[1][0]["number"] == 24
+    assert plan[0][0]["number"] == 23
+
+
+def test_plan_fill_ins_never_assigns_one_episode_twice():
+    eps = _eps(24)
+    a, b = _ranked(eps, {24: 0.90}), _ranked(eps, {24: 0.80})
+    plan = I._plan_fill_ins([(0, a, None), (1, b, None)], set(), min_score=0.40)
+    assert list(plan) == [0]
+
+
+def test_plan_fill_ins_honors_each_files_window():
+    eps = _eps(10, 24)
+    ranked = _ranked(eps, {10: 0.99, 24: 0.50})
+    plan = I._plan_fill_ins([(0, ranked, (20, 30))], set(), min_score=0.40)
+    assert plan[0][0]["number"] == 24  # E10 scores higher but is outside this file's disc
+
+
+def test_plan_fill_ins_min_score_zero_takes_any_unclaimed_episode():
+    eps = _eps(1, 2)
+    ranked = _ranked(eps, {1: 0.05, 2: 0.02})
+    assert I._plan_fill_ins([(0, ranked, None)], set(), min_score=0.0)[0][0]["number"] == 1

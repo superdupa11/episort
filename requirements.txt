@@ -5,6 +5,12 @@
 #   Ubuntu:  sudo apt install ffmpeg
 #   Windows: https://ffmpeg.org/download.html
 #
+# Optional system requirement: tesseract (for PGS/Blu-ray bitmap subtitle OCR —
+# a fast-path tried before Whisper when a file's only embedded subtitles are
+# image-based; see --no-ocr). Runs entirely locally, ~26MB, no GPU needed.
+#   macOS:   brew install tesseract
+#   Ubuntu:  sudo apt install tesseract-ocr
+#
 # Install Python deps:
 #   pip install -r requirements.txt
 #
@@ -15,9 +21,14 @@
 requests>=2.31.0
 
 # Fuzzy text matching (tolerates typos/OCR noise in community-made subtitles)
-# and its numpy dependency for vectorized similarity scoring.
+# and its numpy dependency for vectorized similarity scoring. numpy is also
+# reused by the PGS OCR decoder's YCbCr->RGB palette conversion.
 rapidfuzz>=3.6.0
 numpy>=1.24.0
 
 # Optional — remove if you won't use Whisper transcription
 openai-whisper>=20231117
+
+# Optional — remove if you won't use PGS subtitle OCR (image-based subtitles
+# fall through to Whisper transcription instead, as before this feature existed)
+pillow>=10.0.0
