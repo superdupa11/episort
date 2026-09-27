@@ -3562,7 +3562,7 @@ def _settle_unmatched(
                 result["matched"] = f"{key} - {ep['name']}" if ep.get("name") else key
                 result["fill_score"] = score
                 if p["log_kwargs"]["log_dir"] is not None:
-                    write_match_log(**{**p["log_kwargs"], "final_match": ep, "note": note})
+                    write_match_log(**{**p["log_kwargs"], "final_match": ep, "confidence": score, "note": note})
                 continue
 
         if picked is None:
